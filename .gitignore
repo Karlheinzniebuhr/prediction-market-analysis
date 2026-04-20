@@ -14,6 +14,7 @@ wheels/
 .backfill_cursor
 data
 data.zip
+data/history_pma
 
 research/*
 !research/main.tex

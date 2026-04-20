@@ -3,8 +3,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from simple_term_menu import TerminalMenu
-
 from src.common.analysis import Analysis
 from src.common.indexer import Indexer
 from src.common.util import package_data
@@ -53,13 +51,24 @@ def analyze(name: str | None = None):
         sys.exit(1)
 
     # Interactive menu mode
+    try:
+        from simple_term_menu import TerminalMenu as TMenu
+    except ImportError:
+        print("Interactive menu requires simple-term-menu (not available on Windows).")
+        print("Use: python main.py analyze <name>  (or 'all')")
+        print("\nAvailable analyses:")
+        for analysis_cls in analyses:
+            instance = analysis_cls()
+            print(f"  - {instance.name}: {instance.description}")
+        sys.exit(1)
+
     options = ["[All] Run all analyses"]
     for analysis_cls in analyses:
         instance = analysis_cls()
         options.append(f"{snake_to_title(instance.name)}: {instance.description}")
     options.append("[Exit]")
 
-    menu = TerminalMenu(
+    menu = TMenu(
         options,
         title="Select an analysis to run (use arrow keys):",
         cycle_cursor=True,
@@ -92,22 +101,46 @@ def analyze(name: str | None = None):
             print(f"  {fmt}: {path}")
 
 
-def index():
-    """Interactive indexer selection menu."""
+def index(name: str | None = None):
+    """Run indexer by name or show interactive menu."""
     indexers = Indexer.load()
 
     if not indexers:
         print("No indexers found in src/indexers/")
         return
 
-    # Build menu options
+    if name:
+        for indexer_cls in indexers:
+            instance = indexer_cls()
+            if instance.name == name:
+                print(f"\nRunning: {instance.name}\n")
+                instance.run()
+                print("\nIndexer complete.")
+                return
+        print(f"Indexer '{name}' not found. Available indexers:")
+        for indexer_cls in indexers:
+            instance = indexer_cls()
+            print(f"  - {instance.name}")
+        sys.exit(1)
+
+    try:
+        from simple_term_menu import TerminalMenu as TMenu
+    except ImportError:
+        print("Interactive menu requires simple-term-menu (not available on Windows).")
+        print("Use: python main.py index <indexer_name>")
+        print("\nAvailable indexers:")
+        for indexer_cls in indexers:
+            instance = indexer_cls()
+            print(f"  - {instance.name}: {instance.description}")
+        sys.exit(1)
+
     options = []
     for indexer_cls in indexers:
         instance = indexer_cls()
         options.append(f"{snake_to_title(instance.name)}: {instance.description}")
     options.append("[Exit]")
 
-    menu = TerminalMenu(
+    menu = TMenu(
         options,
         title="Select an indexer to run (use arrow keys):",
         cycle_cursor=True,
@@ -146,7 +179,8 @@ def main():
         sys.exit(0)
 
     if command == "index":
-        index()
+        idx_name = sys.argv[2] if len(sys.argv) > 2 else None
+        index(idx_name)
         sys.exit(0)
 
     if command == "package":
