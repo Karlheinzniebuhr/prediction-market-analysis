@@ -663,8 +663,8 @@ def main() -> None:
         help="Output path for the warehouse (e.g., data/history_pma)"
     )
     parser.add_argument(
-        "--exclude-durations", default="5m,15m",
-        help="Comma-separated updown durations to exclude (default: 5m,15m)"
+        "--exclude-durations", default="",
+        help="Comma-separated updown durations to exclude (default: none — include all)"
     )
     parser.add_argument(
         "--max-trade-files", type=int, default=0,
