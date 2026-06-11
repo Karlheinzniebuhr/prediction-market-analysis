@@ -2,9 +2,10 @@
 
 import concurrent.futures
 import os
+import time
 from collections.abc import Generator
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 
 from dotenv import load_dotenv
 from web3 import Web3
@@ -38,6 +39,25 @@ ORDER_FILLED_ABI = {
 
 # Public Polygon RPC
 POLYGON_RPC = os.getenv("POLYGON_RPC", "")
+RPC_MAX_RETRIES = int(os.getenv("POLYGON_RPC_MAX_RETRIES", "6"))
+RPC_RETRY_BASE_SEC = float(os.getenv("POLYGON_RPC_RETRY_BASE_SEC", "2.0"))
+
+T = TypeVar("T")
+
+
+def _rpc_call_with_retry(fn: Callable[[], T], label: str) -> T:
+    last_err: Exception | None = None
+    for attempt in range(RPC_MAX_RETRIES):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            err = str(e).lower()
+            if "429" in err or "too many requests" in err:
+                time.sleep(min(60.0, RPC_RETRY_BASE_SEC * (2 ** attempt)))
+                continue
+            raise
+    raise last_err  # type: ignore[misc]
 
 
 @dataclass
@@ -116,11 +136,14 @@ class PolygonClient:
 
     def get_block_number(self) -> int:
         """Get current block number."""
-        return self.w3.eth.block_number
+        return _rpc_call_with_retry(lambda: self.w3.eth.block_number, "get_block_number")
 
     def get_block_timestamp(self, block_number: int) -> int:
         """Get timestamp for a block."""
-        block = self.w3.eth.get_block(block_number)
+        block = _rpc_call_with_retry(
+            lambda: self.w3.eth.get_block(block_number),
+            f"get_block_timestamp({block_number})",
+        )
         return block["timestamp"]
 
     def _decode_order_filled(self, log: dict, contract) -> BlockchainTrade:
@@ -151,13 +174,16 @@ class PolygonClient:
         """Fetch OrderFilled events from a block range."""
         contract = self.ctf_exchange if contract_address.lower() == CTF_EXCHANGE.lower() else self.negrisk_exchange
 
-        logs = self.w3.eth.get_logs(
-            {
-                "address": Web3.to_checksum_address(contract_address),
-                "topics": [ORDER_FILLED_TOPIC],
-                "fromBlock": from_block,
-                "toBlock": to_block,
-            }
+        logs = _rpc_call_with_retry(
+            lambda: self.w3.eth.get_logs(
+                {
+                    "address": Web3.to_checksum_address(contract_address),
+                    "topics": [ORDER_FILLED_TOPIC],
+                    "fromBlock": from_block,
+                    "toBlock": to_block,
+                }
+            ),
+            f"get_logs({from_block}-{to_block})",
         )
 
         trades = []

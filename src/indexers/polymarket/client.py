@@ -41,6 +41,19 @@ class PolymarketClient:
             return [Market.from_dict(m) for m in data]
         return [Market.from_dict(m) for m in data.get("markets", data)]
 
+    def get_markets_keyset(self, limit: int = 100, after_cursor: Optional[str] = None, **kwargs) -> tuple[list[Market], Optional[str]]:
+        """Fetch markets from Gamma API using keyset pagination."""
+        params = {"limit": limit, **kwargs}
+        if after_cursor:
+            params["after_cursor"] = after_cursor
+        data = self._get(f"{self.gamma_url}/markets/keyset", params=params)
+        
+        markets_raw = data.get("markets", []) if isinstance(data, dict) else []
+        next_cursor = data.get("next_cursor") if isinstance(data, dict) else None
+        
+        markets = [Market.from_dict(m) for m in markets_raw]
+        return markets, next_cursor
+
     def iter_markets(self, limit: int = 500, offset: int = 0) -> Generator[tuple[list[Market], int], None, None]:
         """Iterate through all markets using offset pagination.
 

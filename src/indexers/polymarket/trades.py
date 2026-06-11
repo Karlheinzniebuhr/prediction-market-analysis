@@ -1,5 +1,7 @@
 """Indexer for Polymarket trades from the Polygon blockchain."""
 
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +20,9 @@ from src.indexers.polymarket.blockchain import (
 
 DATA_DIR = Path("data/polymarket/trades")
 CURSOR_FILE = Path("data/polymarket/.backfill_block_cursor")
+DEFAULT_CHUNK_SIZE = int(os.getenv("TRADES_CHUNK_SIZE", "50"))
+TRADES_MAX_WORKERS = int(os.getenv("TRADES_MAX_WORKERS", "16"))
+TRADES_INFLIGHT_CHUNKS = int(os.getenv("TRADES_INFLIGHT_CHUNKS", "64"))
 
 
 class PolymarketTradesIndexer(Indexer):
@@ -27,7 +32,7 @@ class PolymarketTradesIndexer(Indexer):
         self,
         from_block: Optional[int] = None,
         to_block: Optional[int] = None,
-        chunk_size: int = 1000,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
     ):
         super().__init__(
             name="polymarket_trades",
@@ -113,43 +118,69 @@ class PolymarketTradesIndexer(Indexer):
         total_chunks = len(ranges)
         pbar = tqdm(total=total_chunks, desc="Backfilling", unit=" chunks")
 
+        def fetch_chunk_trades(chunk_start: int, chunk_end: int) -> list[dict]:
+            fetched_at = datetime.utcnow()
+            chunk_rows: list[dict] = []
+
+            def fetch_contract(contract_name: str, contract_address: str) -> list[dict]:
+                rows: list[dict] = []
+                trades = client.get_trades(
+                    from_block=chunk_start,
+                    to_block=chunk_end,
+                    contract_address=contract_address,
+                )
+                for trade in trades:
+                    trade_dict = asdict(trade)
+                    trade_dict["maker_asset_id"] = str(trade_dict["maker_asset_id"])
+                    trade_dict["taker_asset_id"] = str(trade_dict["taker_asset_id"])
+                    trade_dict["_fetched_at"] = fetched_at
+                    trade_dict["_contract"] = contract_name
+                    rows.append(trade_dict)
+                return rows
+
+            with ThreadPoolExecutor(max_workers=2) as contract_pool:
+                futures = [
+                    contract_pool.submit(fetch_contract, contract_name, contract_address)
+                    for contract_name, contract_address in contracts
+                ]
+                for future in futures:
+                    chunk_rows.extend(future.result())
+            return chunk_rows
+
+        def commit_chunk(chunk_end: int, chunk_trades: list[dict]) -> None:
+            nonlocal all_trades
+            all_trades.extend(chunk_trades)
+            pbar.update(1)
+            pbar.set_postfix(
+                block=chunk_end,
+                buffer=len(all_trades),
+                saved=total_saved,
+            )
+            while len(all_trades) >= BATCH_SIZE:
+                save_batch(all_trades[:BATCH_SIZE])
+                all_trades = all_trades[BATCH_SIZE:]
+            CURSOR_FILE.write_text(str(chunk_end))
+
         interrupted = False
         try:
-            for chunk_start, chunk_end in ranges:
-                fetched_at = datetime.utcnow()
-
-                # Fetch from both contracts for this block range
-                for contract_name, contract_address in contracts:
-                    trades = client.get_trades(
-                        from_block=chunk_start,
-                        to_block=chunk_end,
-                        contract_address=contract_address,
-                    )
-
-                    for trade in trades:
-                        trade_dict = asdict(trade)
-                        # Convert large ints to strings to avoid parquet overflow
-                        trade_dict["maker_asset_id"] = str(trade_dict["maker_asset_id"])
-                        trade_dict["taker_asset_id"] = str(trade_dict["taker_asset_id"])
-                        trade_dict["_fetched_at"] = fetched_at
-                        trade_dict["_contract"] = contract_name
-                        all_trades.append(trade_dict)
-
-                # Update progress after both contracts processed for this range
-                pbar.update(1)
-                pbar.set_postfix(
-                    block=chunk_end,
-                    buffer=len(all_trades),
-                    saved=total_saved,
-                )
-
-                # Save in batches
-                while len(all_trades) >= BATCH_SIZE:
-                    save_batch(all_trades[:BATCH_SIZE])
-                    all_trades = all_trades[BATCH_SIZE:]
-
-                # Save cursor after both contracts processed for this range
-                CURSOR_FILE.write_text(str(chunk_end))
+            next_to_commit = 0
+            pending: dict[int, tuple[int, list[dict]]] = {}
+            with ThreadPoolExecutor(max_workers=TRADES_MAX_WORKERS) as chunk_pool:
+                for batch_start in range(0, len(ranges), TRADES_INFLIGHT_CHUNKS):
+                    batch = ranges[batch_start : batch_start + TRADES_INFLIGHT_CHUNKS]
+                    futures = {
+                        chunk_pool.submit(fetch_chunk_trades, chunk_start, chunk_end): batch_start + local_idx
+                        for local_idx, (chunk_start, chunk_end) in enumerate(batch)
+                    }
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        chunk_end = ranges[idx][1]
+                        chunk_trades = future.result()
+                        pending[idx] = (chunk_end, chunk_trades)
+                        while next_to_commit in pending:
+                            end_block, rows = pending.pop(next_to_commit)
+                            commit_chunk(end_block, rows)
+                            next_to_commit += 1
 
         except KeyboardInterrupt:
             interrupted = True

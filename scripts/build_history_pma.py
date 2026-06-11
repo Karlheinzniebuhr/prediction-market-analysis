@@ -1,6 +1,6 @@
 """
 build_history_pma.py — Convert raw prediction-market-analysis Parquet data into
-the history_pma warehouse format used by the Hivemind anomaly study pipeline.
+the history_pma warehouse format (date-partitioned crypto trade legs).
 
 Reads:
   data/polymarket/markets/*.parquet   (market metadata)
@@ -17,7 +17,7 @@ Writes:
 
 Usage:
   python scripts/build_history_pma.py --source-root data/polymarket --output-root data/history_pma
-  python scripts/build_history_pma.py --source-root E:/prediction-market-analysis/data/polymarket --output-root E:/history_pma
+  python scripts/build_history_pma.py --source-root data/polymarket --output-root data/history_pma --exclude-durations "" --resume
 """
 
 from __future__ import annotations
@@ -522,6 +522,27 @@ def flush_legs(
     return total_bytes, part_counter
 
 
+def load_resume_state(output_root: Path) -> tuple[int, int]:
+    """Return (skip_trade_files, part_counter) from prior warehouse state."""
+    skip_files = 0
+    part_counter = 0
+    progress_path = output_root / "state" / "import_progress.json"
+    checkpoint_path = output_root / "state" / "checkpoint.json"
+    if progress_path.exists():
+        try:
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            skip_files = int(progress.get("files_processed", 0) or 0)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    if checkpoint_path.exists():
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            part_counter = int(checkpoint.get("partCounter", 0) or 0)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return skip_files, part_counter
+
+
 def process_trades(
     source_root: Path,
     output_root: Path,
@@ -529,6 +550,8 @@ def process_trades(
     block_resolver: BlockTimestampResolver,
     *,
     max_files: int = 0,
+    skip_files: int = 0,
+    part_counter: int = 0,
 ) -> dict[str, Any]:
     """Main trade processing loop."""
     trades_dir = source_root / "trades"
@@ -537,18 +560,19 @@ def process_trades(
         raise FileNotFoundError(f"No trade parquet files under {trades_dir}")
 
     total_files = len(trade_files)
+    if skip_files > 0:
+        trade_files = trade_files[skip_files:]
+        print(f"[trades] skipping first {skip_files:,} already-processed files")
     if max_files > 0:
         trade_files = trade_files[:max_files]
     print(f"[trades] {len(trade_files)} of {total_files} trade files to process")
 
     trade_legs_dir = output_root / "warehouse" / "facts" / "trade_legs"
     trade_legs_dir.mkdir(parents=True, exist_ok=True)
-
-    part_counter = 0
     buffer: list[dict[str, Any]] = []
     stats = {
         "tradeFilesTotal": total_files,
-        "tradeFilesProcessed": 0,
+        "tradeFilesProcessed": skip_files,
         "tradeRowsRead": 0,
         "fillsMapped": 0,
         "legsWritten": 0,
@@ -638,9 +662,17 @@ def process_trades(
         "bytesWritten": stats["bytesWritten"],
         "partCounter": part_counter,
     })
+    prior_legs = 0
+    progress_path = state_dir / "import_progress.json"
+    if progress_path.exists() and skip_files > 0:
+        try:
+            prior = json.loads(progress_path.read_text(encoding="utf-8"))
+            prior_legs = int(prior.get("legs_written", 0) or 0)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            prior_legs = 0
     write_json(state_dir / "import_progress.json", {
         "files_processed": stats["tradeFilesProcessed"],
-        "legs_written": stats["legsWritten"],
+        "legs_written": prior_legs + stats["legsWritten"],
     })
 
     return stats
@@ -673,6 +705,14 @@ def main() -> None:
     parser.add_argument(
         "--block-cache-files", type=int, default=6,
         help="Max block timestamp files to keep in memory (default: 6)"
+    )
+    parser.add_argument(
+        "--skip-trade-files", type=int, default=0,
+        help="Skip the first N sorted trade files (for incremental updates)"
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume from output state (import_progress + checkpoint)"
     )
     args = parser.parse_args()
 
@@ -711,9 +751,20 @@ def main() -> None:
         max_cached=args.block_cache_files,
     )
 
+    skip_files = max(0, args.skip_trade_files)
+    part_counter = 0
+    if args.resume:
+        resume_skip, resume_part = load_resume_state(output_root)
+        skip_files = max(skip_files, resume_skip)
+        part_counter = resume_part
+        if skip_files or part_counter:
+            print(f"[resume] skip_trade_files={skip_files:,} part_counter={part_counter:,}")
+
     stats = process_trades(
         source_root, output_root, token_map, block_resolver,
         max_files=args.max_trade_files,
+        skip_files=skip_files,
+        part_counter=part_counter,
     )
 
     elapsed = time.time() - t_start

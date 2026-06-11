@@ -3,6 +3,7 @@
 import concurrent.futures
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -18,7 +19,8 @@ BLOCKS_DIR = Path("data/polymarket/blocks")
 
 BUCKET_SIZE = 100_000  # 100k blocks per file
 SAMPLE_INTERVAL = 100  # Fetch every 100th block, interpolate the rest
-MAX_WORKERS = 100
+MAX_WORKERS = int(os.getenv("BLOCKS_MAX_WORKERS", "8"))
+MAX_FETCH_RETRIES = 5
 
 
 class PolymarketBlocksIndexer(Indexer):
@@ -32,12 +34,19 @@ class PolymarketBlocksIndexer(Indexer):
 
     def _fetch_timestamp(self, client: PolygonClient, block_number: int) -> Optional[tuple[int, int]]:
         """Fetch timestamp for a single block. Returns (block_number, unix_timestamp)."""
-        try:
-            unix_timestamp = client.get_block_timestamp(block_number)
-            return (block_number, unix_timestamp)
-        except Exception as e:
-            tqdm.write(f"Error fetching block {block_number}: {e}")
-            return None
+        for attempt in range(MAX_FETCH_RETRIES):
+            try:
+                unix_timestamp = client.get_block_timestamp(block_number)
+                return (block_number, unix_timestamp)
+            except Exception as e:
+                err = str(e).lower()
+                if "429" in err or "too many requests" in err:
+                    time.sleep(min(30.0, 2.0 ** attempt))
+                    continue
+                tqdm.write(f"Error fetching block {block_number}: {e}")
+                return None
+        tqdm.write(f"Error fetching block {block_number}: rate-limited after {MAX_FETCH_RETRIES} retries")
+        return None
 
     def _interpolate_timestamps(self, sampled: list[tuple[int, int]], start_block: int, end_block: int) -> list[dict]:
         """Interpolate timestamps for all blocks between sampled points."""

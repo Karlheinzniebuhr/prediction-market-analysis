@@ -22,6 +22,7 @@ dependencies = [
     "web3>=6.0.0",
     "simple-term-menu>=1.6.0",
     "python-dotenv>=1.2.1",
+    "zstandard>=0.23.0",
 ]
 
 [dependency-groups]

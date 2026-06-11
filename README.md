@@ -20,10 +20,10 @@ Currently supported features:
 Requires Python 3.9+. Install dependencies with [uv](https://github.com/astral-sh/uv):
 
 ```bash
-uv sync
+uv sync   # httpx, zstandard, duckdb, pyarrow, web3, ...
 ```
 
-Download and extract the pre-collected dataset (36GiB compressed):
+Download and extract the pre-collected dataset (36GiB compressed; requires `zstandard`):
 
 ```bash
 # Linux / macOS
@@ -37,19 +37,21 @@ This downloads `data.tar.zst` from [Cloudflare R2 Storage](https://s3.jbecker.de
 
 ### Data Collection
 
-Collect market and trade data from prediction market APIs:
+Collect market and trade data from prediction market APIs and Polygon RPC:
 
 ```bash
 # Interactive menu (Linux/macOS — requires simple-term-menu)
 make index
 
-# Non-interactive / Windows
-python main.py index polymarket_trades
-python main.py index polymarket_markets
-python main.py index polymarket_blocks
+# Non-interactive / Windows — three Polymarket indexers (run in this order for extensions)
+python main.py index polymarket_markets   # Gamma API metadata → data/polymarket/markets/
+python main.py index polymarket_blocks    # Polygon block timestamps → data/polymarket/blocks/
+python main.py index polymarket_trades    # Polygon OrderFilled events → data/polymarket/trades/
 ```
 
-Data is saved to `data/kalshi/` and `data/polymarket/` directories. Progress is saved automatically, so you can interrupt and resume collection.
+Data is saved to `data/kalshi/` and `data/polymarket/`. Progress is saved automatically (cursor files under `data/polymarket/`), so you can interrupt and resume.
+
+> These indexers are **Phase 2** of the warehouse update (extend raw data beyond the hosted snapshot). For the full workflow, see [Building the history_pma Warehouse](#building-the-history_pma-warehouse) below.
 
 ### Running Analyses
 
@@ -78,14 +80,84 @@ This creates a zstd-compressed tar archive (`data.tar.zst`) and removes the `dat
 
 ## Building the `history_pma` Warehouse
 
-The raw data stored under `data/polymarket/` contains on-chain OrderFilled events (trades),
-block timestamps, and market metadata — all as Parquet files with raw blockchain field names
-and values. This format is excellent for archival and general analysis, but it is not
-directly usable for wallet-level behavioral studies.
+Default output: `data/history_pma/` (gitignored). Override with `HISTORY_PMA_OUTPUT_ROOT` for a
+large external drive. Raw source: `data/polymarket/`.
 
-The `build_history_pma.py` script transforms this raw data into a **research-ready warehouse**
-called `history_pma` — a structured, date-partitioned Parquet dataset designed for efficient
-querying of "who traded what, when, and in which direction."
+Raw `data/polymarket/` holds **three Parquet layers** that `build_history_pma.py` joins:
+
+| Layer | Indexer | Source | Output |
+|-------|---------|--------|--------|
+| Markets | `polymarket_markets` | **Gamma API** (`gamma-api.polymarket.com`) | `data/polymarket/markets/*.parquet` |
+| Blocks | `polymarket_blocks` | **Polygon RPC** (block timestamps) | `data/polymarket/blocks/*.parquet` |
+| Trades | `polymarket_trades` | **Polygon RPC** (CTF/NegRisk `OrderFilled` logs) | `data/polymarket/trades/*.parquet` |
+
+`build_history_pma.py` transforms those into **date-partitioned trade legs** at
+`data/history_pma/warehouse/facts/trade_legs/date=YYYY-MM-DD/`.
+
+### End-to-end update (read this first)
+
+**Two phases.** Phase 1 alone does **not** bring the warehouse past ~Jan 2026 — the hosted
+tarball has not been republished with newer trades.
+
+| Phase | When to run | One command (Windows) | Resulting max `date=*` |
+|-------|-------------|----------------------|------------------------|
+| **1 — Bulk refresh** | Repair dims / replay hosted snapshot | `scripts/update_history_pma.ps1` | **~Jan 25, 2026** |
+| **2 — Extend to current** | After Phase 1, or when legs lag today | `scripts/extend_history_pma.ps1` | **Chain head** (hours–days RPC) |
+
+```
+Phase 1:  download.py  →  raw parquet (snapshot)  →  build_history_pma.py  →  data/history_pma
+Phase 2:  polymarket_markets (Gamma)
+       →  polymarket_blocks (Polygon)
+       →  polymarket_trades (Polygon, resumes .backfill_block_cursor)
+       →  build_history_pma.py --resume  →  append new date partitions
+```
+
+Full checklist: [docs/UPDATE_HISTORY_PMA.md](docs/UPDATE_HISTORY_PMA.md).
+
+#### Phase 1 — bulk refresh (hosted snapshot)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/update_history_pma.ps1
+```
+
+Manual equivalent:
+
+```powershell
+uv sync   # includes zstandard (required for download.py extract)
+uv run python -u scripts/download.py --force
+# If extract leaves macOS sidecar files, remove before build:
+# Get-ChildItem data/polymarket -Recurse -Filter '._*' | Remove-Item -Force
+uv run python -u scripts/build_history_pma.py `
+  --source-root data/polymarket `
+  --output-root data/history_pma `
+  --exclude-durations=''
+```
+
+#### Phase 2 — extend to current month (Gamma + Polygon RPC)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/extend_history_pma.ps1
+```
+
+Runs all four steps: Gamma markets → block timestamps → raw trades (long pole) →
+`build_history_pma.py --resume` (skips snapshot trade files already in `import_progress.json`).
+
+Configure RPC in `.env`: `POLYGON_RPC`, `TRADES_CHUNK_SIZE=1000`, `TRADES_MAX_WORKERS=16`.
+
+Rebuild only (raw trades already extended):
+
+```powershell
+powershell ... -File scripts/extend_history_pma.ps1 -SkipIndexers
+```
+
+#### Verify
+
+```powershell
+Get-Content data/history_pma/state/registry_meta.json
+Get-Content data/history_pma/state/import_progress.json
+Get-ChildItem data/history_pma/warehouse/facts/trade_legs -Directory |
+  Sort-Object Name -Descending | Select-Object -First 3 Name
+```
 
 ### Why this transformation exists
 
@@ -110,7 +182,7 @@ fields (77-digit token IDs) and `block_number` instead of timestamps. To answer 
 ### What the warehouse contains
 
 ```
-history_pma/
+data/history_pma/
 ├── state/
 │   ├── checkpoint.json          # Processing resume state
 │   ├── registry_meta.json       # Registry version, market/token counts, hashes
@@ -176,7 +248,7 @@ date partitioning, time-range queries skip irrelevant partitions automatically.
 
 ```sql
 SELECT wallet, SUM(CASE WHEN side='buy' THEN -usdc ELSE usdc END) AS realized_pnl
-FROM read_parquet('history_pma/warehouse/facts/trade_legs/**/*.parquet', hive_partitioning=true)
+FROM read_parquet('data/history_pma/warehouse/facts/trade_legs/**/*.parquet', hive_partitioning=true)
 WHERE tsSec BETWEEN 1700000000 AND 1710000000
 GROUP BY wallet
 ORDER BY realized_pnl DESC
@@ -188,50 +260,67 @@ LIMIT 20
 ```python
 import polars as pl
 
-legs = pl.scan_parquet("history_pma/warehouse/facts/trade_legs/**/*.parquet", hive_partitioning=True)
-markets = pl.scan_parquet("history_pma/warehouse/dim/markets.parquet")
+legs = pl.scan_parquet("data/history_pma/warehouse/facts/trade_legs/**/*.parquet", hive_partitioning=True)
+markets = pl.scan_parquet("data/history_pma/warehouse/dim/markets.parquet")
 btc_conditions = markets.filter(pl.col("question").str.contains("(?i)btc|bitcoin")).select("conditionId")
 btc_legs = legs.join(btc_conditions.collect(), on="conditionId").collect()
 ```
 
-### Building the warehouse
+### `build_history_pma.py` reference
+
+```powershell
+# Full rebuild (Phase 1, after download)
+uv run python -u scripts/build_history_pma.py `
+  --source-root data/polymarket `
+  --output-root data/history_pma `
+  --exclude-durations=''
+
+# Incremental append (Phase 2, after new raw trade files exist)
+uv run python -u scripts/build_history_pma.py `
+  --source-root data/polymarket `
+  --output-root data/history_pma `
+  --exclude-durations='' `
+  --resume
+```
 
 ```bash
-# Full build from raw data (processes ~40k trade files, ~27 GB output)
-python scripts/build_history_pma.py \
+# Linux/macOS
+uv run python -u scripts/build_history_pma.py \
   --source-root data/polymarket \
-  --output-root data/history_pma
+  --output-root data/history_pma \
+  --exclude-durations ""
+```
 
-# Test with a small subset first
-python scripts/build_history_pma.py \
+Local smoke test only (not production):
+
+```bash
+uv run python scripts/build_history_pma.py \
   --source-root data/polymarket \
   --output-root data/history_pma_test \
   --max-trade-files 10
-
-# Build from external drive (avoids local disk copies)
-python scripts/build_history_pma.py \
-  --source-root E:/prediction-market-analysis/data/polymarket \
-  --output-root E:/history_pma
 ```
-
-Options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--source-root` | (required) | Path to raw PMA data (must contain `markets/`, `trades/`, `blocks/`) |
-| `--output-root` | (required) | Output path for the warehouse |
-| `--exclude-durations` | `5m,15m` | Updown market durations to exclude |
-| `--max-trade-files` | `0` (all) | Limit trade files processed (for testing) |
-| `--block-cache-files` | `6` | Max block-timestamp files cached in memory |
+| `--source-root` | (required) | Raw PMA root with `markets/`, `trades/`, `blocks/` subdirs |
+| `--output-root` | (required) | Warehouse root (default in scripts: `data/history_pma`) |
+| `--exclude-durations` | `""` | Comma-separated updown durations to drop; empty = include all |
+| `--max-trade-files` | `0` (all) | Limit trade files (smoke tests) |
+| `--block-cache-files` | `6` | Max block parquet files cached in memory |
+| `--resume` | off | Skip files counted in `state/import_progress.json` (Phase 2 append) |
+
+**PowerShell note:** pass an empty exclude list as `--exclude-durations=''`. Bare `""` is swallowed by the shell.
 
 ## Project Structure
 
 ```
 ├── scripts/
-│   ├── build_history_pma.py  # Warehouse builder (Python, cross-platform)
-│   ├── download.py           # Cross-platform dataset downloader
-│   ├── download.sh           # Linux/macOS dataset downloader
-│   └── install-tools.sh      # Linux/macOS tool installer
+│   ├── build_history_pma.py         # Raw parquet → trade_legs warehouse
+│   ├── update_history_pma.ps1       # Phase 1: download + full build
+│   ├── extend_history_pma.ps1       # Phase 2: indexers + --resume append
+│   ├── download.py                  # Hosted snapshot download + zstd extract
+│   ├── download.sh                  # Linux/macOS dataset downloader
+│   └── install-tools.sh             # Linux/macOS tool installer
 ├── src/
 │   ├── analysis/             # Analysis scripts
 │   │   ├── kalshi/           # Kalshi-specific analyses
@@ -249,17 +338,15 @@ Options:
 │   │   ├── blocks/           # Block number → timestamp mapping
 │   │   ├── markets/          # Market metadata (conditions, outcomes, slugs)
 │   │   └── trades/           # Raw CTF/NegRisk OrderFilled events
-│   └── history_pma/          # Built warehouse (gitignored, generated)
-│       ├── state/
-│       └── warehouse/
-│           ├── dim/
-│           └── facts/
+│   └── .download_complete    # Sentinel after successful download.py extract
+├── logs/                     # Update logs (download, indexers, build; gitignored)
 ├── docs/                     # Documentation
 └── output/                   # Analysis outputs (figures, CSVs)
 ```
 
 ## Documentation
 
+- [Updating history_pma](docs/UPDATE_HISTORY_PMA.md) - End-to-end warehouse update (Phase 1 + Phase 2)
 - [Data Schemas](docs/SCHEMAS.md) - Parquet file schemas for markets and trades
 - [Writing Analyses](docs/ANALYSIS.md) - Guide for writing custom analysis scripts
 
