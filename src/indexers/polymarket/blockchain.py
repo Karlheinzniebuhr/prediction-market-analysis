@@ -53,7 +53,23 @@ def _rpc_call_with_retry(fn: Callable[[], T], label: str) -> T:
         except Exception as e:
             last_err = e
             err = str(e).lower()
-            if "429" in err or "too many requests" in err:
+            retryable = any(
+                token in err
+                for token in (
+                    "429",
+                    "too many requests",
+                    "timeout",
+                    "timed out",
+                    "connection",
+                    "reset",
+                    "502",
+                    "503",
+                    "504",
+                    "gateway",
+                    "rate limit",
+                )
+            )
+            if retryable:
                 time.sleep(min(60.0, RPC_RETRY_BASE_SEC * (2 ** attempt)))
                 continue
             raise
