@@ -8,29 +8,26 @@
 #   HISTORY_PMA_SOURCE_ROOT  (default: data/polymarket)
 #   HISTORY_PMA_OUTPUT_ROOT  (default: data/history_pma)
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "_pma_invoke.ps1")
 $RepoRoot = Split-Path $PSScriptRoot -Parent
 $LogDir = Join-Path $RepoRoot "logs"
 $SourceRoot = if ($env:HISTORY_PMA_SOURCE_ROOT) { $env:HISTORY_PMA_SOURCE_ROOT } else { "data/polymarket" }
 $OutputRoot = if ($env:HISTORY_PMA_OUTPUT_ROOT) { $env:HISTORY_PMA_OUTPUT_ROOT } else { "data/history_pma" }
+$RunStamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Set-Location $RepoRoot
 $env:PYTHONUNBUFFERED = "1"
 
-Write-Host "[1/2] Downloading hosted raw PMA snapshot..."
-uv run python -u scripts/download.py --force 2>&1 | Tee-Object -FilePath (Join-Path $LogDir "download.log")
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "download.py failed with exit code $LASTEXITCODE"
+Invoke-PmaStep "[1/2] Downloading hosted raw PMA snapshot..." (Join-Path $LogDir "download_${RunStamp}.log") {
+    uv run python -u scripts/download.py --force
 }
 
-Write-Host "[2/2] Building warehouse at $OutputRoot ..."
-uv run python -u scripts/build_history_pma.py `
-  --source-root $SourceRoot `
-  --output-root $OutputRoot `
-  --exclude-durations='' `
-  2>&1 | Tee-Object -FilePath (Join-Path $LogDir "build_history_pma.log")
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "build_history_pma.py failed with exit code $LASTEXITCODE"
+Invoke-PmaStep "[2/2] Building warehouse at $OutputRoot ..." (Join-Path $LogDir "build_history_pma_${RunStamp}.log") {
+    uv run python -u scripts/build_history_pma.py `
+      --source-root $SourceRoot `
+      --output-root $OutputRoot `
+      --exclude-durations=''
 }
 
 Write-Host "Done. See $OutputRoot/state/import_progress.json"

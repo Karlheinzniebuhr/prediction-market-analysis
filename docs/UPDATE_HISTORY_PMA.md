@@ -83,6 +83,14 @@ Rebuild only (raw trades already extended):
 powershell ... -File scripts/extend_history_pma.ps1 -SkipIndexers
 ```
 
+Resume after a partial Phase 2 run (e.g. markets/blocks done, trades interrupted):
+
+```powershell
+powershell ... -File scripts/extend_history_pma.ps1 -FromStep 3
+```
+
+**Windows note:** tqdm progress bars write to stderr. The update scripts normalize this so PowerShell does not treat progress output as a fatal error.
+
 ## Incremental rebuild (build logic changed, raw files unchanged)
 
 ```powershell
