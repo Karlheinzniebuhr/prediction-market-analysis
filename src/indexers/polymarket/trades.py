@@ -23,10 +23,10 @@ from src.indexers.polymarket.blockchain import (
 DATA_DIR = Path("data/polymarket/trades")
 CURSOR_FILE = Path("data/polymarket/.backfill_block_cursor")
 DEFAULT_CHUNK_SIZE = int(os.getenv("TRADES_CHUNK_SIZE", "200"))
-TRADES_MAX_WORKERS = int(os.getenv("TRADES_MAX_WORKERS", "6"))
-TRADES_INFLIGHT_CHUNKS = int(os.getenv("TRADES_INFLIGHT_CHUNKS", "8"))
+TRADES_MAX_WORKERS = int(os.getenv("TRADES_MAX_WORKERS", "4"))
+TRADES_INFLIGHT_CHUNKS = int(os.getenv("TRADES_INFLIGHT_CHUNKS", "4"))
 TRADES_CHUNK_RETRIES = int(os.getenv("TRADES_CHUNK_RETRIES", "8"))
-TRADES_BATCH_PAUSE_SEC = float(os.getenv("TRADES_BATCH_PAUSE_SEC", "0.75"))
+TRADES_BATCH_PAUSE_SEC = float(os.getenv("TRADES_BATCH_PAUSE_SEC", "1.5"))
 
 
 class PolymarketTradesIndexer(Indexer):
@@ -164,6 +164,8 @@ class PolymarketTradesIndexer(Indexer):
                 token in err
                 for token in (
                     "429",
+                    "400",
+                    "bad request",
                     "too many requests",
                     "timeout",
                     "timed out",

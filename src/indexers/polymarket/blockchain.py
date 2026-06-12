@@ -57,6 +57,8 @@ def _rpc_call_with_retry(fn: Callable[[], T], label: str) -> T:
                 token in err
                 for token in (
                     "429",
+                    "400",
+                    "bad request",
                     "too many requests",
                     "timeout",
                     "timed out",
@@ -190,10 +192,10 @@ class PolygonClient:
                 "too large",
                 "limit exceeded",
                 "query returned more than",
-                "bad request",
-                "400 client error",
                 "413",
                 "response size",
+                "result too large",
+                "exceeds max",
             )
         )
 
