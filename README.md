@@ -142,7 +142,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/extend_history_pma.p
 Runs all four steps: Gamma markets → block timestamps → raw trades (long pole) →
 `build_history_pma.py --resume` (skips snapshot trade files already in `import_progress.json`).
 
-Configure RPC in `.env`: `POLYGON_RPC`, `TRADES_CHUNK_SIZE=1000`, `TRADES_MAX_WORKERS=16`.
+Configure RPC in `.env`: `POLYGON_RPC`, `TRADES_CHUNK_SIZE=200`, `TRADES_MAX_WORKERS=6`, `TRADES_INFLIGHT_CHUNKS=8`, `TRADES_BATCH_PAUSE_SEC=0.75` (raise only if stable).
 
 Rebuild only (raw trades already extended):
 
