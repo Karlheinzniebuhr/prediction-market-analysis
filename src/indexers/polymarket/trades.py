@@ -22,10 +22,11 @@ from src.indexers.polymarket.blockchain import (
 
 DATA_DIR = Path("data/polymarket/trades")
 CURSOR_FILE = Path("data/polymarket/.backfill_block_cursor")
-DEFAULT_CHUNK_SIZE = int(os.getenv("TRADES_CHUNK_SIZE", "50"))
-TRADES_MAX_WORKERS = int(os.getenv("TRADES_MAX_WORKERS", "16"))
-TRADES_INFLIGHT_CHUNKS = int(os.getenv("TRADES_INFLIGHT_CHUNKS", "64"))
-TRADES_CHUNK_RETRIES = int(os.getenv("TRADES_CHUNK_RETRIES", "12"))
+DEFAULT_CHUNK_SIZE = int(os.getenv("TRADES_CHUNK_SIZE", "200"))
+TRADES_MAX_WORKERS = int(os.getenv("TRADES_MAX_WORKERS", "6"))
+TRADES_INFLIGHT_CHUNKS = int(os.getenv("TRADES_INFLIGHT_CHUNKS", "8"))
+TRADES_CHUNK_RETRIES = int(os.getenv("TRADES_CHUNK_RETRIES", "8"))
+TRADES_BATCH_PAUSE_SEC = float(os.getenv("TRADES_BATCH_PAUSE_SEC", "0.75"))
 
 
 class PolymarketTradesIndexer(Indexer):
@@ -126,42 +127,78 @@ class PolymarketTradesIndexer(Indexer):
         total_chunks = len(ranges)
         pbar = tqdm(total=total_chunks, desc="Backfilling", unit=" chunks")
 
+        def _fetch_chunk_once(chunk_start: int, chunk_end: int) -> list[dict]:
+            fetched_at = datetime.utcnow()
+            chunk_rows: list[dict] = []
+
+            def fetch_contract(contract_name: str, contract_address: str) -> list[dict]:
+                rows: list[dict] = []
+                trades = client.get_trades(
+                    from_block=chunk_start,
+                    to_block=chunk_end,
+                    contract_address=contract_address,
+                )
+                for trade in trades:
+                    trade_dict = asdict(trade)
+                    trade_dict["maker_asset_id"] = str(trade_dict["maker_asset_id"])
+                    trade_dict["taker_asset_id"] = str(trade_dict["taker_asset_id"])
+                    trade_dict["_fetched_at"] = fetched_at
+                    trade_dict["_contract"] = contract_name
+                    rows.append(trade_dict)
+                return rows
+
+            with ThreadPoolExecutor(max_workers=2) as contract_pool:
+                futures = [
+                    contract_pool.submit(fetch_contract, contract_name, contract_address)
+                    for contract_name, contract_address in contracts
+                ]
+                for future in futures:
+                    chunk_rows.extend(future.result())
+            return chunk_rows
+
+        def _is_transient_rpc_error(exc: Exception) -> bool:
+            if PolygonClient._should_split_log_range(exc):
+                return False
+            err = str(exc).lower()
+            return any(
+                token in err
+                for token in (
+                    "429",
+                    "too many requests",
+                    "timeout",
+                    "timed out",
+                    "connection",
+                    "reset",
+                    "502",
+                    "503",
+                    "504",
+                    "gateway",
+                    "rate limit",
+                )
+            )
+
         def fetch_chunk_trades(chunk_start: int, chunk_end: int) -> list[dict]:
             last_err: Exception | None = None
             for attempt in range(TRADES_CHUNK_RETRIES):
                 try:
-                    fetched_at = datetime.utcnow()
-                    chunk_rows: list[dict] = []
-
-                    def fetch_contract(contract_name: str, contract_address: str) -> list[dict]:
-                        rows: list[dict] = []
-                        trades = client.get_trades(
-                            from_block=chunk_start,
-                            to_block=chunk_end,
-                            contract_address=contract_address,
-                        )
-                        for trade in trades:
-                            trade_dict = asdict(trade)
-                            trade_dict["maker_asset_id"] = str(trade_dict["maker_asset_id"])
-                            trade_dict["taker_asset_id"] = str(trade_dict["taker_asset_id"])
-                            trade_dict["_fetched_at"] = fetched_at
-                            trade_dict["_contract"] = contract_name
-                            rows.append(trade_dict)
-                        return rows
-
-                    with ThreadPoolExecutor(max_workers=2) as contract_pool:
-                        futures = [
-                            contract_pool.submit(fetch_contract, contract_name, contract_address)
-                            for contract_name, contract_address in contracts
-                        ]
-                        for future in futures:
-                            chunk_rows.extend(future.result())
-                    return chunk_rows
+                    return _fetch_chunk_once(chunk_start, chunk_end)
                 except Exception as exc:
                     last_err = exc
+                    if PolygonClient._should_split_log_range(exc) and chunk_end > chunk_start:
+                        mid = (chunk_start + chunk_end) // 2
+                        tqdm.write(
+                            f"Chunk {chunk_start}-{chunk_end} too large; "
+                            f"splitting at {mid}"
+                        )
+                        time.sleep(0.05)
+                        return fetch_chunk_trades(chunk_start, mid) + fetch_chunk_trades(
+                            mid + 1, chunk_end
+                        )
+                    if not _is_transient_rpc_error(exc):
+                        raise
                     wait_s = min(120.0, 2.0 ** attempt)
                     tqdm.write(
-                        f"Chunk {chunk_start}-{chunk_end} failed ({exc}); "
+                        f"Chunk {chunk_start}-{chunk_end} transient error ({exc}); "
                         f"retry {attempt + 1}/{TRADES_CHUNK_RETRIES} in {wait_s:.0f}s"
                     )
                     time.sleep(wait_s)
@@ -187,6 +224,8 @@ class PolymarketTradesIndexer(Indexer):
             pending: dict[int, tuple[int, list[dict]]] = {}
             with ThreadPoolExecutor(max_workers=TRADES_MAX_WORKERS) as chunk_pool:
                 for batch_start in range(0, len(ranges), TRADES_INFLIGHT_CHUNKS):
+                    if batch_start > 0 and TRADES_BATCH_PAUSE_SEC > 0:
+                        time.sleep(TRADES_BATCH_PAUSE_SEC)
                     batch = ranges[batch_start : batch_start + TRADES_INFLIGHT_CHUNKS]
                     futures = {
                         chunk_pool.submit(fetch_chunk_trades, chunk_start, chunk_end): batch_start + local_idx
