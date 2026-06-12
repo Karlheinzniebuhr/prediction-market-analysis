@@ -181,6 +181,22 @@ class PolygonClient:
             fee=args["fee"],
         )
 
+    @staticmethod
+    def _should_split_log_range(exc: Exception) -> bool:
+        err = str(exc).lower()
+        return any(
+            token in err
+            for token in (
+                "too large",
+                "limit exceeded",
+                "query returned more than",
+                "bad request",
+                "400 client error",
+                "413",
+                "response size",
+            )
+        )
+
     def get_trades(
         self,
         from_block: int,
@@ -190,17 +206,25 @@ class PolygonClient:
         """Fetch OrderFilled events from a block range."""
         contract = self.ctf_exchange if contract_address.lower() == CTF_EXCHANGE.lower() else self.negrisk_exchange
 
-        logs = _rpc_call_with_retry(
-            lambda: self.w3.eth.get_logs(
-                {
-                    "address": Web3.to_checksum_address(contract_address),
-                    "topics": [ORDER_FILLED_TOPIC],
-                    "fromBlock": from_block,
-                    "toBlock": to_block,
-                }
-            ),
-            f"get_logs({from_block}-{to_block})",
-        )
+        try:
+            logs = _rpc_call_with_retry(
+                lambda: self.w3.eth.get_logs(
+                    {
+                        "address": Web3.to_checksum_address(contract_address),
+                        "topics": [ORDER_FILLED_TOPIC],
+                        "fromBlock": from_block,
+                        "toBlock": to_block,
+                    }
+                ),
+                f"get_logs({from_block}-{to_block})",
+            )
+        except Exception as exc:
+            if self._should_split_log_range(exc) and to_block > from_block:
+                mid = (from_block + to_block) // 2
+                return self.get_trades(from_block, mid, contract_address) + self.get_trades(
+                    mid + 1, to_block, contract_address
+                )
+            raise
 
         trades = []
         for log in logs:
