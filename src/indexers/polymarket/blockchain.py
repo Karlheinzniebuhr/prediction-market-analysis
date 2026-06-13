@@ -228,6 +228,12 @@ class PolygonClient:
                 )
             raise
 
+        if len(logs) >= 10_000 and to_block > from_block:
+            mid = (from_block + to_block) // 2
+            return self.get_trades(from_block, mid, contract_address) + self.get_trades(
+                mid + 1, to_block, contract_address
+            )
+
         trades = []
         for log in logs:
             try:

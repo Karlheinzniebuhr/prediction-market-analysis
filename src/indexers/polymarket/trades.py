@@ -3,7 +3,7 @@
 import os
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -22,11 +22,11 @@ from src.indexers.polymarket.blockchain import (
 
 DATA_DIR = Path("data/polymarket/trades")
 CURSOR_FILE = Path("data/polymarket/.backfill_block_cursor")
-DEFAULT_CHUNK_SIZE = int(os.getenv("TRADES_CHUNK_SIZE", "200"))
-TRADES_MAX_WORKERS = int(os.getenv("TRADES_MAX_WORKERS", "4"))
-TRADES_INFLIGHT_CHUNKS = int(os.getenv("TRADES_INFLIGHT_CHUNKS", "4"))
+DEFAULT_CHUNK_SIZE = int(os.getenv("TRADES_CHUNK_SIZE", "100"))
+TRADES_MAX_WORKERS = int(os.getenv("TRADES_MAX_WORKERS", "20"))
+TRADES_INFLIGHT_CHUNKS = int(os.getenv("TRADES_INFLIGHT_CHUNKS", str(TRADES_MAX_WORKERS)))
 TRADES_CHUNK_RETRIES = int(os.getenv("TRADES_CHUNK_RETRIES", "8"))
-TRADES_BATCH_PAUSE_SEC = float(os.getenv("TRADES_BATCH_PAUSE_SEC", "1.5"))
+TRADES_BATCH_PAUSE_SEC = float(os.getenv("TRADES_BATCH_PAUSE_SEC", "0"))
 
 
 class PolymarketTradesIndexer(Indexer):
@@ -47,19 +47,13 @@ class PolymarketTradesIndexer(Indexer):
         self._chunk_size = chunk_size
 
     def run(self) -> None:
-        """Backfill all Polymarket trades from the Polygon blockchain.
-
-        This fetches OrderFilled events from both CTF Exchange contracts
-        (regular and NegRisk) and saves them to parquet files.
-        """
-        BATCH_SIZE = 10000
+        """Backfill all Polymarket trades from the Polygon blockchain."""
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
 
         client = PolygonClient()
         current_block = client.get_block_number()
 
-        # Determine starting block
         from_block = self._from_block
         if from_block is None:
             if CURSOR_FILE.exists():
@@ -71,59 +65,40 @@ class PolymarketTradesIndexer(Indexer):
             else:
                 from_block = POLYMARKET_START_BLOCK
 
-        to_block = self._to_block
-        if to_block is None:
-            to_block = current_block
+        to_block = self._to_block or current_block
 
         print(f"Fetching trades from block {from_block} to {to_block}")
         print(f"Total blocks: {to_block - from_block:,}")
+        print(
+            "Throttle: "
+            f"chunk={self._chunk_size}, workers={TRADES_MAX_WORKERS}, "
+            f"inflight={TRADES_INFLIGHT_CHUNKS}, pause={TRADES_BATCH_PAUSE_SEC}s"
+        )
 
-        all_trades = []
         total_saved = 0
         contracts = [
             ("CTF Exchange", CTF_EXCHANGE),
             ("NegRisk CTF Exchange", NEGRISK_CTF_EXCHANGE),
         ]
 
-        def get_next_chunk_idx():
-            existing = list(DATA_DIR.glob("trades_*.parquet"))
-            if not existing:
-                return 0
-            indices = []
-            for f in existing:
-                parts = f.stem.split("_")
-                if len(parts) >= 2:
-                    try:
-                        indices.append(int(parts[1]))
-                    except ValueError:
-                        pass
-            return max(indices) + BATCH_SIZE if indices else 0
-
-        def save_batch(trades_batch):
+        def save_chunk(chunk_start: int, chunk_end: int, trades_batch: list[dict]) -> int:
             nonlocal total_saved
             if not trades_batch:
-                return
-            blocks = [int(row.get("block_number", 0) or 0) for row in trades_batch]
-            block_start = min(blocks)
-            block_end = max(blocks)
-            chunk_path = DATA_DIR / f"trades_{block_start}_{block_end}.parquet"
-            if chunk_path.exists():
-                chunk_idx = get_next_chunk_idx()
-                chunk_path = DATA_DIR / f"trades_{chunk_idx}_{chunk_idx + BATCH_SIZE}.parquet"
+                return 0
+            chunk_path = DATA_DIR / f"trades_{chunk_start}_{chunk_end}.parquet"
             df = pd.DataFrame(trades_batch)
             df.to_parquet(chunk_path)
             total_saved += len(trades_batch)
             tqdm.write(f"Saved {len(trades_batch)} trades to {chunk_path.name}")
+            return len(trades_batch)
 
-        # Build list of chunk ranges
-        ranges = []
+        ranges: list[tuple[int, int]] = []
         current = from_block
         while current <= to_block:
             end = min(current + self._chunk_size - 1, to_block)
             ranges.append((current, end))
             current = end + 1
 
-        # Process by block range, fetching from both contracts for each range
         total_chunks = len(ranges)
         pbar = tqdm(total=total_chunks, desc="Backfilling", unit=" chunks")
 
@@ -188,17 +163,12 @@ class PolymarketTradesIndexer(Indexer):
                     last_err = exc
                     if PolygonClient._should_split_log_range(exc) and chunk_end > chunk_start:
                         mid = (chunk_start + chunk_end) // 2
-                        tqdm.write(
-                            f"Chunk {chunk_start}-{chunk_end} too large; "
-                            f"splitting at {mid}"
-                        )
+                        tqdm.write(f"Chunk {chunk_start}-{chunk_end} too large; splitting at {mid}")
                         time.sleep(0.05)
-                        return fetch_chunk_trades(chunk_start, mid) + fetch_chunk_trades(
-                            mid + 1, chunk_end
-                        )
+                        return fetch_chunk_trades(chunk_start, mid) + fetch_chunk_trades(mid + 1, chunk_end)
                     if not _is_transient_rpc_error(exc):
                         raise
-                    wait_s = min(120.0, 2.0 ** attempt)
+                    wait_s = min(120.0, 2.0**attempt)
                     tqdm.write(
                         f"Chunk {chunk_start}-{chunk_end} transient error ({exc}); "
                         f"retry {attempt + 1}/{TRADES_CHUNK_RETRIES} in {wait_s:.0f}s"
@@ -206,58 +176,56 @@ class PolymarketTradesIndexer(Indexer):
                     time.sleep(wait_s)
             raise last_err  # type: ignore[misc]
 
-        def commit_chunk(chunk_end: int, chunk_trades: list[dict]) -> None:
-            nonlocal all_trades
-            all_trades.extend(chunk_trades)
+        def commit_chunk(idx: int, chunk_trades: list[dict]) -> None:
+            chunk_start, chunk_end = ranges[idx]
+            saved = save_chunk(chunk_start, chunk_end, chunk_trades)
             pbar.update(1)
-            pbar.set_postfix(
-                block=chunk_end,
-                buffer=len(all_trades),
-                saved=total_saved,
-            )
-            while len(all_trades) >= BATCH_SIZE:
-                save_batch(all_trades[:BATCH_SIZE])
-                all_trades = all_trades[BATCH_SIZE:]
+            pbar.set_postfix(block=chunk_end, saved=total_saved, last=saved)
             CURSOR_FILE.write_text(str(chunk_end))
 
         interrupted = False
         try:
             next_to_commit = 0
-            pending: dict[int, tuple[int, list[dict]]] = {}
+            pending: dict[int, list[dict]] = {}
+            submit_idx = 0
+            in_flight: dict = {}
+
             with ThreadPoolExecutor(max_workers=TRADES_MAX_WORKERS) as chunk_pool:
-                for batch_start in range(0, len(ranges), TRADES_INFLIGHT_CHUNKS):
-                    if batch_start > 0 and TRADES_BATCH_PAUSE_SEC > 0:
-                        time.sleep(TRADES_BATCH_PAUSE_SEC)
-                    batch = ranges[batch_start : batch_start + TRADES_INFLIGHT_CHUNKS]
-                    futures = {
-                        chunk_pool.submit(fetch_chunk_trades, chunk_start, chunk_end): batch_start + local_idx
-                        for local_idx, (chunk_start, chunk_end) in enumerate(batch)
-                    }
-                    for future in as_completed(futures):
-                        idx = futures[future]
-                        chunk_end = ranges[idx][1]
-                        chunk_trades = future.result()
-                        pending[idx] = (chunk_end, chunk_trades)
+                while submit_idx < total_chunks and len(in_flight) < TRADES_INFLIGHT_CHUNKS:
+                    chunk_start, chunk_end = ranges[submit_idx]
+                    future = chunk_pool.submit(fetch_chunk_trades, chunk_start, chunk_end)
+                    in_flight[future] = submit_idx
+                    submit_idx += 1
+
+                while in_flight:
+                    done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        idx = in_flight.pop(future)
+                        pending[idx] = future.result()
+
                         while next_to_commit in pending:
-                            end_block, rows = pending.pop(next_to_commit)
-                            commit_chunk(end_block, rows)
+                            commit_chunk(next_to_commit, pending.pop(next_to_commit))
                             next_to_commit += 1
+                            if TRADES_BATCH_PAUSE_SEC > 0:
+                                time.sleep(TRADES_BATCH_PAUSE_SEC)
+
+                        while submit_idx < total_chunks and len(in_flight) < TRADES_INFLIGHT_CHUNKS:
+                            chunk_start, chunk_end = ranges[submit_idx]
+                            new_future = chunk_pool.submit(fetch_chunk_trades, chunk_start, chunk_end)
+                            in_flight[new_future] = submit_idx
+                            submit_idx += 1
 
         except KeyboardInterrupt:
             interrupted = True
             print("\nInterrupted. Progress saved.")
         except Exception as exc:
             traceback.print_exc()
-            print(f"\nBackfill failed at cursor block {CURSOR_FILE.read_text().strip() if CURSOR_FILE.exists() else from_block}: {exc}")
+            cursor = CURSOR_FILE.read_text().strip() if CURSOR_FILE.exists() else str(from_block)
+            print(f"\nBackfill failed at cursor block {cursor}: {exc}")
             raise SystemExit(1) from exc
         finally:
             pbar.close()
 
-        # Save remaining trades
-        if all_trades:
-            save_batch(all_trades)
-
-        # Only clean up cursor on successful completion
         if not interrupted and CURSOR_FILE.exists():
             CURSOR_FILE.unlink()
 

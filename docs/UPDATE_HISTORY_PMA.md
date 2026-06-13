@@ -64,11 +64,13 @@ Configure `.env` in the repo root (see `.env.example` if present):
 
 ```
 POLYGON_RPC=https://polygon.drpc.org
-TRADES_CHUNK_SIZE=200
-TRADES_MAX_WORKERS=4
-TRADES_INFLIGHT_CHUNKS=4
-TRADES_BATCH_PAUSE_SEC=1.5
+TRADES_CHUNK_SIZE=100
+TRADES_MAX_WORKERS=20
+TRADES_INFLIGHT_CHUNKS=20
+TRADES_BATCH_PAUSE_SEC=0
 BLOCKS_MAX_WORKERS=8
+
+Tune with `uv run python scripts/probe_trades_rpc.py` (writes `logs/trades_rpc_probe.json`).
 ```
 
 Optional custom warehouse location:
