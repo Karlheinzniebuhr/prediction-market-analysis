@@ -1,120 +1,123 @@
-# Prediction Market Analysis
+# prediction-market-analysis — ML-ready warehouse fork
 
-A framework for analyzing prediction market data, including the largest publicly available dataset of Polymarket and Kalshi market and trade data. Provides tools for data collection, storage, and running analysis scripts that generate figures and statistics.
+**A data transformation layer on top of [Jon Becker's prediction-market-analysis](https://github.com/Jon-Becker/prediction-market-analysis)** — the largest public Polymarket dataset. This fork adds a pure-Python, cross-platform ETL that converts 185M+ raw on-chain fill events into a **research-ready warehouse** of timestamped, wallet-attributed, direction-labeled trade legs in Hive-partitioned Parquet.
 
-## Overview
-
-This project enables research and analysis of prediction markets by providing:
-- Pre-collected datasets from Polymarket and Kalshi
-- Data collection indexers for gathering new data
-- Analysis framework for generating figures and statistics
-
-Currently supported features:
-- Market metadata collection (Kalshi & Polymarket)
-- Trade history collection via API and blockchain
-- Parquet-based storage with automatic progress saving
-- Extensible analysis script framework
-
-## Installation & Usage
-
-Requires Python 3.9+. Install dependencies with [uv](https://github.com/astral-sh/uv):
-
-```bash
-uv sync   # httpx, zstandard, duckdb, pyarrow, web3, ...
-```
-
-Download and extract the pre-collected dataset (36GiB compressed; requires `zstandard`):
-
-```bash
-# Linux / macOS
-make setup
-
-# Windows / cross-platform
-python scripts/download.py
-```
-
-This downloads `data.tar.zst` from [Cloudflare R2 Storage](https://s3.jbecker.dev/data.tar.zst) and extracts it to `data/`.
-
-### Data Collection
-
-Collect market and trade data from prediction market APIs and Polygon RPC:
-
-```bash
-# Interactive menu (Linux/macOS — requires simple-term-menu)
-make index
-
-# Non-interactive / Windows — three Polymarket indexers (run in this order for extensions)
-python main.py index polymarket_markets   # Gamma API metadata → data/polymarket/markets/
-python main.py index polymarket_blocks    # Polygon block timestamps → data/polymarket/blocks/
-python main.py index polymarket_trades    # Polygon OrderFilled events → data/polymarket/trades/
-```
-
-Data is saved to `data/kalshi/` and `data/polymarket/`. Progress is saved automatically (cursor files under `data/polymarket/`), so you can interrupt and resume.
-
-> These indexers are **Phase 2** of the warehouse update (extend raw data beyond the hosted snapshot). For the full workflow, see [Building the history_pma Warehouse](#building-the-history_pma-warehouse) below.
-
-### Running Analyses
-
-```bash
-# Interactive menu
-make analyze
-
-# Non-interactive / Windows
-python main.py analyze all
-python main.py analyze <analysis_name>
-```
-
-Output files (PNG, PDF, CSV, JSON) are saved to `output/`.
-
-### Packaging Data
-
-To compress the data directory for storage/distribution:
-
-```bash
-make package
-```
-
-This creates a zstd-compressed tar archive (`data.tar.zst`) and removes the `data/` directory.
+No Node.js required. Built for ML pipelines, rolling wallet windows, and fast queries with DuckDB, Polars, and PyArrow.
 
 ---
 
-## Building the `history_pma` Warehouse
+## What this fork adds (vs upstream)
 
-Default output: `data/history_pma/` (gitignored). Override with `HISTORY_PMA_OUTPUT_ROOT` for a
-large external drive. Raw source: `data/polymarket/`.
+| | **Upstream** ([Jon-Becker/prediction-market-analysis](https://github.com/Jon-Becker/prediction-market-analysis)) | **This fork** |
+|---|---|---|
+| **Raw data** | Hosted tarball + indexers → `markets/`, `trades/`, `blocks/` Parquet | Same (inherits + extends) |
+| **Research warehouse** | — | **`build_history_pma.py`** → date-partitioned `trade_legs` |
+| **Trade direction** | Opaque 77-digit token IDs, block numbers | Explicit **`buy` / `sell`**, **`wallet`**, **`tsSec`** |
+| **Fill → legs** | One row per on-chain fill | **Two legs per fill** (maker + taker) |
+| **Time queries** | Join blocks + decode collateral logic | **Hive `date=YYYY-MM-DD/`** partitions |
+| **Crypto filter** | All categories | Pre-filtered **crypto markets** + optional updown exclusions |
+| **Windows workflow** | Linux/macOS Makefile focus | **`update_history_pma.ps1`**, resumable **`download.py`**, RPC probe |
+| **Extend to today** | Indexers exist | **Phase 2 playbook**: Gamma + Polygon RPC → `--resume` append |
 
-Raw `data/polymarket/` holds **three Parquet layers** that `build_history_pma.py` joins:
+Upstream remains the source of truth for raw archival data, analysis scripts, and Kalshi coverage. **Our contribution is the transformation layer** — turning that archival blockchain data into something ML pipelines can actually consume.
 
-| Layer | Indexer | Source | Output |
-|-------|---------|--------|--------|
-| Markets | `polymarket_markets` | **Gamma API** (`gamma-api.polymarket.com`) | `data/polymarket/markets/*.parquet` |
-| Blocks | `polymarket_blocks` | **Polygon RPC** (block timestamps) | `data/polymarket/blocks/*.parquet` |
-| Trades | `polymarket_trades` | **Polygon RPC** (CTF/NegRisk `OrderFilled` logs) | `data/polymarket/trades/*.parquet` |
+---
 
-`build_history_pma.py` transforms those into **date-partitioned trade legs** at
-`data/history_pma/warehouse/facts/trade_legs/date=YYYY-MM-DD/`.
+## Why this exists
 
-### End-to-end update (read this first)
+> We're open-sourcing a data transformation layer for on-chain Polymarket trade data.
+>
+> It converts **185M+ raw blockchain fill events** into a research-ready warehouse of **timestamped, wallet-attributed, direction-labeled trade legs** in date-partitioned Parquet — built for ML, and easy to query with DuckDB, Polars, and PyArrow.
 
-**Two phases.** Phase 1 alone does **not** bring the warehouse past ~Jan 2026 — the hosted
-tarball has not been republished with newer trades.
+Raw Polymarket data is hard to work with. You get opaque 77-digit token IDs, block numbers instead of timestamps, and no explicit notion of “buy” vs “sell.” Even a simple question like *“what did wallet X trade on March 15?”* requires joining multiple tables and decoding collateral logic. **We automated that entire layer.**
 
-| Phase | When to run | One command (Windows) | Resulting max `date=*` |
-|-------|-------------|----------------------|------------------------|
-| **1 — Bulk refresh** | Repair dims / replay hosted snapshot | `scripts/update_history_pma.ps1` | **~Jan 25, 2026** |
-| **2 — Extend to current** | After Phase 1, or when legs lag today | `scripts/extend_history_pma.ps1` | **Chain head** (hours–days RPC) |
+We built this to study **wallet-level behavioral patterns over time for ML models** — rolling windows of per-wallet activity, resolved to real timestamps, with explicit trade direction, recomputed at every time step to avoid look-ahead bias. Raw blockchain events don't give you that out of the box.
+
+The result is **~27 GB of Snappy-compressed Parquet**. Because it's date-partitioned, DuckDB and Polars skip irrelevant partitions automatically. Queries that would otherwise take hours can run in seconds — the difference between *“run overnight”* and *“iterate live in a notebook.”*
+
+---
+
+## The ETL pipeline
+
+`scripts/build_history_pma.py` reads three raw layers from [Becker's dataset](https://github.com/Jon-Becker/prediction-market-analysis) and writes the warehouse:
 
 ```
-Phase 1:  download.py  →  raw parquet (snapshot)  →  build_history_pma.py  →  data/history_pma
-Phase 2:  polymarket_markets (Gamma)
-       →  polymarket_blocks (Polygon)
-       →  polymarket_trades (Polygon, resumes .backfill_block_cursor)
-       →  build_history_pma.py --resume  →  append new date partitions
+data/polymarket/markets/   ← Gamma API metadata (via polymarket_markets indexer)
+data/polymarket/blocks/    ← block_number → timestamp (via polymarket_blocks indexer)
+data/polymarket/trades/    ← CTF/NegRisk OrderFilled events (via polymarket_trades indexer)
+         │
+         ▼  build_history_pma.py
+data/history_pma/warehouse/
+├── dim/markets.parquet      # ~150K crypto markets
+├── dim/tokens.parquet       # ~130K outcome tokens
+└── facts/trade_legs/date=YYYY-MM-DD/part-*.parquet
 ```
 
-Full checklist: [docs/UPDATE_HISTORY_PMA.md](docs/UPDATE_HISTORY_PMA.md).
+### What the builder does
 
-#### Phase 1 — bulk refresh (hosted snapshot)
+1. **Block → timestamp** — `BlockTimestampResolver` indexes hundreds of block-range Parquet files with binary search + LRU caching (`--block-cache-files`, default 6).
+2. **Token ID → market/outcome** — DuckDB scan of Gamma market metadata; builds `dim/markets` and `dim/tokens` registries.
+3. **Fill → two trade legs** — each `OrderFilled` event becomes maker + taker rows with `wallet`, `role`, `side`, `shares`, `usdc`, `price`, `feeUsdc`.
+4. **Buy/sell decoding** — collateral (`asset_id == 0`) vs outcome token determines direction per leg.
+5. **Crypto pre-filter** — keyword match on market question (BTC, ETH, SOL, …); optional updown duration exclusions.
+6. **Hive partitioning** — legs written to `date=YYYY-MM-DD/` from resolved `tsSec` for partition pruning.
+
+Processing is resumable: `state/import_progress.json` tracks files and leg counts; `--resume` skips already-imported trade chunks (Phase 2 append).
+
+---
+
+## Warehouse layout
+
+```
+data/history_pma/
+├── state/
+│   ├── checkpoint.json
+│   ├── registry_meta.json       # market/token counts, schema version
+│   └── import_progress.json     # files processed, legs written
+└── warehouse/
+    ├── dim/
+    │   ├── markets.parquet
+    │   └── tokens.parquet
+    └── facts/trade_legs/
+        ├── date=2023-03-05/part-00000001.parquet
+        └── ...
+```
+
+### Trade leg schema
+
+| Column | Description |
+|--------|-------------|
+| `fillId` | Unique fill id (`txHash_logIndex_contract`) |
+| `tsSec` | Unix timestamp (from block resolver) |
+| `wallet` / `counterparty` | Addresses for this leg |
+| `role` | `maker` or `taker` |
+| `side` | **`buy` or `sell`** (collateral logic decoded) |
+| `tokenId` / `conditionId` / `outcomeIndex` | Market linkage |
+| `shares`, `usdc`, `price`, `feeUsdc` | Human-scale amounts |
+| `source` | Provenance (`pma_adapter_python_v1`) |
+
+Full column reference and raw schemas: [docs/SCHEMAS.md](docs/SCHEMAS.md).
+
+---
+
+## Quick start
+
+Requires **Python 3.9+** and [uv](https://github.com/astral-sh/uv):
+
+```bash
+uv sync
+```
+
+Override paths for a large drive:
+
+```powershell
+$env:HISTORY_PMA_SOURCE_ROOT = "path/to/data/polymarket"
+$env:HISTORY_PMA_OUTPUT_ROOT  = "path/to/history_pma"
+```
+
+### Phase 1 — bulk refresh (hosted snapshot, ~Jan 2026 cap)
+
+Downloads [Becker's hosted archive](https://s3.jbecker.dev/data.tar.zst) (~36 GiB) and runs a full warehouse build.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/update_history_pma.ps1
@@ -123,159 +126,41 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/update_history_pma.p
 Manual equivalent:
 
 ```powershell
-uv sync   # includes zstandard (required for download.py extract)
 uv run python -u scripts/download.py --force
-# If extract leaves macOS sidecar files, remove before build:
-# Get-ChildItem data/polymarket -Recurse -Filter '._*' | Remove-Item -Force
 uv run python -u scripts/build_history_pma.py `
   --source-root data/polymarket `
   --output-root data/history_pma `
   --exclude-durations=''
 ```
 
-#### Phase 2 — extend to current month (Gamma + Polygon RPC)
+Phase 1 alone does **not** pass ~January 2026 — the hosted tarball has not been republished with newer trades.
+
+### Phase 2 — extend to chain head
+
+After Phase 1, backfill raw data via Gamma + Polygon RPC, then append warehouse partitions.
+
+**All four steps** (wrapper):
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/extend_history_pma.ps1
 ```
 
-Runs all four steps: Gamma markets → block timestamps → raw trades (long pole) →
-`build_history_pma.py --resume` (skips snapshot trade files already in `import_progress.json`).
-
-Configure RPC in `.env`: `POLYGON_RPC`, `TRADES_CHUNK_SIZE=100`, `TRADES_MAX_WORKERS=20`, `TRADES_INFLIGHT_CHUNKS=20` (from `scripts/probe_trades_rpc.py` on drpc; re-probe if you change RPC).
-
-Rebuild only (raw trades already extended):
+**Manual** (same commands; each step resumes automatically):
 
 ```powershell
-powershell ... -File scripts/extend_history_pma.ps1 -SkipIndexers
-```
+cd path/to/prediction-market-analysis
+$env:PYTHONUNBUFFERED = "1"
 
-#### Verify
+# 1) Markets (Gamma) — cursor: data/polymarket/.backfill_markets_cursor
+uv run python -u main.py index polymarket_markets
 
-```powershell
-Get-Content data/history_pma/state/registry_meta.json
-Get-Content data/history_pma/state/import_progress.json
-Get-ChildItem data/history_pma/warehouse/facts/trade_legs -Directory |
-  Sort-Object Name -Descending | Select-Object -First 3 Name
-```
+# 2) Blocks (Polygon RPC)
+uv run python -u main.py index polymarket_blocks
 
-### Why this transformation exists
+# 3) Trades (Polygon RPC, long pole) — cursor: data/polymarket/.backfill_block_cursor
+uv run python -u main.py index polymarket_trades
 
-The raw PMA trades are **fill-level records** with opaque `maker_asset_id` / `taker_asset_id`
-fields (77-digit token IDs) and `block_number` instead of timestamps. To answer questions like
-"did wallet X buy or sell Bitcoin-related exposure on March 15?" you need to:
-
-1. **Resolve block numbers to timestamps** — join trades against `blocks/*.parquet` to get
-   real dates.
-2. **Map asset IDs to markets** — join against `markets/*.parquet` to link token IDs to
-   specific prediction markets (condition IDs, questions, outcomes).
-3. **Determine trade direction** — decode which side of the fill is USDC (collateral) and
-   which is outcome tokens, to derive an explicit `buy` / `sell` side.
-4. **Filter to crypto markets** — the raw dataset covers all Polymarket categories; the
-   warehouse pre-filters to crypto-related markets via keyword matching.
-5. **Split fills into legs** — each fill produces two trade legs (maker + taker), each with
-   an explicit `wallet`, `side`, `shares`, `usdc`, `price`, and `feeUsdc`.
-6. **Date-partition for efficient access** — the output is partitioned as
-   `facts/trade_legs/date=YYYY-MM-DD/*.parquet`, enabling efficient time-range queries with
-   DuckDB, Polars, or any Parquet-aware tool.
-
-### What the warehouse contains
-
-```
-data/history_pma/
-├── state/
-│   ├── checkpoint.json          # Processing resume state
-│   ├── registry_meta.json       # Registry version, market/token counts, hashes
-│   └── import_progress.json     # Files processed, total legs written
-└── warehouse/
-    ├── dim/
-    │   ├── markets.parquet      # Market dimension: conditionId, slug, question, endDate, category
-    │   └── tokens.parquet       # Token dimension: tokenId → conditionId, outcomeIndex, outcome
-    └── facts/
-        └── trade_legs/          # Date-partitioned trade legs
-            ├── date=2023-03-05/
-            │   ├── part-00000001.parquet
-            │   └── ...
-            ├── date=2023-03-06/
-            └── ...
-```
-
-### Trade leg schema
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `fillId` | string | Unique fill identifier (`txHash_logIndex_contract`) |
-| `txHash` | string | Transaction hash |
-| `orderHash` | string | Order hash from the OrderFilled event |
-| `tsSec` | int64 | Unix timestamp (seconds) — resolved from block number |
-| `wallet` | string | Wallet address for this leg (maker or taker) |
-| `counterparty` | string | The other side of the trade |
-| `role` | string | `"maker"` or `"taker"` |
-| `tokenId` | string | Outcome token ID |
-| `conditionId` | string | Market condition ID (links to `dim/markets.parquet`) |
-| `outcomeIndex` | int32 | 0 = first outcome (typically Yes), 1 = second (typically No) |
-| `side` | string | `"buy"` or `"sell"` — derived from which asset is collateral |
-| `sharesRaw` | string | Raw share amount (6-decimal integer as string) |
-| `usdcRaw` | string | Raw USDC amount (6-decimal integer as string) |
-| `feeRaw` | string | Raw fee (only present for maker leg) |
-| `shares` | float64 | Shares in human units (sharesRaw / 1e6) |
-| `usdc` | float64 | USDC in human units (usdcRaw / 1e6) |
-| `feeUsdc` | float64 | Fee in USDC (feeRaw / 1e6, taker leg = 0) |
-| `price` | float64 | Effective price (usdc / shares) |
-| `registryVersion` | int32 | Schema version for the market registry |
-| `source` | string | Provenance label |
-
-### Market dimension schema
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `conditionId` | string | Unique market identifier |
-| `slug` | string | URL-friendly market name |
-| `question` | string | Human-readable market question |
-| `endDateIso` | string | Market end date (ISO format, nullable) |
-| `active` | bool | Whether the market is currently active |
-| `closed` | bool | Whether the market has been resolved |
-| `category` | string | Always `"crypto"` (pre-filtered) |
-| `isExcludedShortTerm` | bool | True for excluded short-term updown markets |
-| `registryVersion` | int32 | Schema version |
-
-### How to use it
-
-The warehouse format is designed for DuckDB, Polars, and PyArrow. Thanks to Hive-style
-date partitioning, time-range queries skip irrelevant partitions automatically.
-
-**DuckDB example** — compute cumulative PnL per wallet:
-
-```sql
-SELECT wallet, SUM(CASE WHEN side='buy' THEN -usdc ELSE usdc END) AS realized_pnl
-FROM read_parquet('data/history_pma/warehouse/facts/trade_legs/**/*.parquet', hive_partitioning=true)
-WHERE tsSec BETWEEN 1700000000 AND 1710000000
-GROUP BY wallet
-ORDER BY realized_pnl DESC
-LIMIT 20
-```
-
-**Polars example** — load all BTC-related trades:
-
-```python
-import polars as pl
-
-legs = pl.scan_parquet("data/history_pma/warehouse/facts/trade_legs/**/*.parquet", hive_partitioning=True)
-markets = pl.scan_parquet("data/history_pma/warehouse/dim/markets.parquet")
-btc_conditions = markets.filter(pl.col("question").str.contains("(?i)btc|bitcoin")).select("conditionId")
-btc_legs = legs.join(btc_conditions.collect(), on="conditionId").collect()
-```
-
-### `build_history_pma.py` reference
-
-```powershell
-# Full rebuild (Phase 1, after download)
-uv run python -u scripts/build_history_pma.py `
-  --source-root data/polymarket `
-  --output-root data/history_pma `
-  --exclude-durations=''
-
-# Incremental append (Phase 2, after new raw trade files exist)
+# 4) Append warehouse (skips snapshot files in import_progress.json)
 uv run python -u scripts/build_history_pma.py `
   --source-root data/polymarket `
   --output-root data/history_pma `
@@ -283,88 +168,154 @@ uv run python -u scripts/build_history_pma.py `
   --resume
 ```
 
-```bash
-# Linux/macOS
-uv run python -u scripts/build_history_pma.py \
-  --source-root data/polymarket \
-  --output-root data/history_pma \
-  --exclude-durations ""
+Trades indexer emits live fetch/save lines to stderr (not just the tqdm bar). Step 3 can run for days on free RPC — tune with `scripts/probe_trades_rpc.py`.
+
+**RPC settings** (`.env`):
+
+```env
+POLYGON_RPC=https://polygon.drpc.org
+TRADES_CHUNK_SIZE=100
+TRADES_MAX_WORKERS=20
+TRADES_INFLIGHT_CHUNKS=20
+TRADES_BATCH_PAUSE_SEC=0
 ```
 
-Local smoke test only (not production):
+Rebuild only (raw trades already extended):
 
-```bash
-uv run python scripts/build_history_pma.py \
-  --source-root data/polymarket \
-  --output-root data/history_pma_test \
-  --max-trade-files 10
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/extend_history_pma.ps1 -SkipIndexers
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--source-root` | (required) | Raw PMA root with `markets/`, `trades/`, `blocks/` subdirs |
-| `--output-root` | (required) | Warehouse root (default in scripts: `data/history_pma`) |
-| `--exclude-durations` | `""` | Comma-separated updown durations to drop; empty = include all |
-| `--max-trade-files` | `0` (all) | Limit trade files (smoke tests) |
-| `--block-cache-files` | `6` | Max block parquet files cached in memory |
-| `--resume` | off | Skip files counted in `state/import_progress.json` (Phase 2 append) |
+### Verify
 
-**PowerShell note:** pass an empty exclude list as `--exclude-durations=''`. Bare `""` is swallowed by the shell.
+```powershell
+Get-Content data/history_pma/state/import_progress.json
+Get-Content data/history_pma/state/registry_meta.json
+Get-ChildItem data/history_pma/warehouse/facts/trade_legs -Directory |
+  Sort-Object Name -Descending | Select-Object -First 3 Name
+Get-Content data/polymarket/.backfill_block_cursor   # gone when trades backfill complete
+```
 
-## Project Structure
+Full checklist: [docs/UPDATE_HISTORY_PMA.md](docs/UPDATE_HISTORY_PMA.md).
+
+---
+
+## Query examples
+
+**DuckDB** — cumulative flow per wallet in a date range:
+
+```sql
+SELECT wallet,
+       SUM(CASE WHEN side = 'buy' THEN -usdc ELSE usdc END) AS net_flow
+FROM read_parquet('data/history_pma/warehouse/facts/trade_legs/**/*.parquet', hive_partitioning=true)
+WHERE tsSec BETWEEN 1700000000 AND 1710000000
+GROUP BY wallet
+ORDER BY net_flow DESC
+LIMIT 20;
+```
+
+**Polars** — BTC-related legs with market questions:
+
+```python
+import polars as pl
+
+legs = pl.scan_parquet("data/history_pma/warehouse/facts/trade_legs/**/*.parquet", hive_partitioning=True)
+markets = pl.scan_parquet("data/history_pma/warehouse/dim/markets.parquet")
+btc = markets.filter(pl.col("question").str.contains("(?i)btc|bitcoin")).select("conditionId")
+df = legs.join(btc.collect(), on="conditionId").collect()
+```
+
+---
+
+## Fork-specific tooling
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/build_history_pma.py` | Raw Parquet → warehouse ETL |
+| `scripts/update_history_pma.ps1` | Phase 1: download + full build |
+| `scripts/extend_history_pma.ps1` | Phase 2: indexers + `--resume` append |
+| `scripts/probe_trades_rpc.py` | Measure safe RPC chunk size / concurrency |
+| `scripts/run_phase2_until_done.ps1` | Watchdog: trades until cursor gone, then build |
+| `scripts/download.py` | Resumable hosted tarball download + zstd extract |
+
+### Trades indexer hardening (Phase 2)
+
+This fork's `polymarket_trades` indexer adds production-oriented behavior upstream lacks:
+
+- **Measured RPC throttle** — chunk size and worker count from `probe_trades_rpc.py` (drpc log-limit aware)
+- **Continuous pipeline** — keeps N chunks in flight (not wave-and-sleep)
+- **Split-on-oversize** — bisects ranges that hit RPC payload / 10k log caps
+- **Resume at cursor + 1** — no duplicate block on restart
+- **Transient retry** — 400s, disconnects, chunked encoding errors backoff instead of exit
+- **Live progress** — fetch/heartbeat lines on stderr for long RPC runs
+
+---
+
+## Inherited from upstream
+
+This fork merges [Jon-Becker/prediction-market-analysis](https://github.com/Jon-Becker/prediction-market-analysis) and keeps:
+
+- **Analysis framework** — `python main.py analyze`, figures in `output/`
+- **Kalshi indexers and analyses**
+- **Consolidated `HttpClient`** with rate limiting and retries
+- **Raw indexers** — `polymarket_markets`, `polymarket_blocks`, `polymarket_trades`, Kalshi API
+
+```bash
+# Interactive analysis menu (Linux/macOS)
+make analyze
+
+# Windows / non-interactive
+uv run python main.py analyze all
+uv run python main.py analyze polymarket_win_rate_by_price
+```
+
+See [docs/ANALYSIS.md](docs/ANALYSIS.md) for writing custom analyses.
+
+---
+
+## Project structure
 
 ```
 ├── scripts/
-│   ├── build_history_pma.py         # Raw parquet → trade_legs warehouse
-│   ├── update_history_pma.ps1       # Phase 1: download + full build
-│   ├── extend_history_pma.ps1       # Phase 2: indexers + --resume append
-│   ├── download.py                  # Hosted snapshot download + zstd extract
-│   ├── download.sh                  # Linux/macOS dataset downloader
-│   └── install-tools.sh             # Linux/macOS tool installer
+│   ├── build_history_pma.py       # ★ Warehouse ETL (fork)
+│   ├── update_history_pma.ps1     # ★ Phase 1 workflow (fork)
+│   ├── extend_history_pma.ps1       # ★ Phase 2 workflow (fork)
+│   ├── probe_trades_rpc.py          # ★ RPC tuning (fork)
+│   ├── download.py                  # Resumable tarball download (fork: zstandard)
+│   └── ...
+├── docs/
+│   ├── UPDATE_HISTORY_PMA.md        # End-to-end update guide
+│   ├── SCHEMAS.md
+│   └── ANALYSIS.md
 ├── src/
-│   ├── analysis/             # Analysis scripts
-│   │   ├── kalshi/           # Kalshi-specific analyses
-│   │   ├── polymarket/       # Polymarket-specific analyses
-│   │   └── comparison/       # Cross-platform comparisons
-│   ├── indexers/             # Data collection indexers
-│   │   ├── kalshi/           # Kalshi API client and indexers
-│   │   └── polymarket/       # Polymarket API/blockchain indexers
-│   └── common/               # Shared utilities and interfaces
-├── data/                     # Data directory (extracted from data.tar.zst)
-│   ├── kalshi/
-│   │   ├── markets/
-│   │   └── trades/
-│   ├── polymarket/
-│   │   ├── blocks/           # Block number → timestamp mapping
-│   │   ├── markets/          # Market metadata (conditions, outcomes, slugs)
-│   │   └── trades/           # Raw CTF/NegRisk OrderFilled events
-│   └── .download_complete    # Sentinel after successful download.py extract
-├── logs/                     # Update logs (download, indexers, build; gitignored)
-├── docs/                     # Documentation
-└── output/                   # Analysis outputs (figures, CSVs)
+│   ├── indexers/polymarket/         # Gamma + Polygon RPC indexers
+│   ├── analysis/                    # Upstream analysis scripts
+│   └── common/
+├── data/
+│   ├── polymarket/                  # Raw layers (markets, blocks, trades)
+│   └── history_pma/                 # ★ Warehouse output (gitignored)
+└── output/                          # Analysis figures
 ```
 
-## Documentation
+---
 
-- [Updating history_pma](docs/UPDATE_HISTORY_PMA.md) - End-to-end warehouse update (Phase 1 + Phase 2)
-- [Data Schemas](docs/SCHEMAS.md) - Parquet file schemas for markets and trades
-- [Writing Analyses](docs/ANALYSIS.md) - Guide for writing custom analysis scripts
+## Credits
+
+**Raw dataset & research platform:** [Jon Becker](https://github.com/Jon-Becker/prediction-market-analysis) — largest public Polymarket + Kalshi archive.
+
+**Warehouse transformation layer:** [Karlheinz Niebuhr](https://github.com/Karlheinzniebuhr/prediction-market-analysis) — ETL, Windows workflow, Phase 2 hardening.
+
+### Research citations (upstream dataset)
+
+- Becker, J. (2026). _The Microstructure of Wealth Transfer in Prediction Markets_. https://jbecker.dev/research/prediction-market-microstructure
+- Le, N. A. (2026). _Decomposing Crowd Wisdom: Domain-Specific Calibration Dynamics in Prediction Markets_. arXiv. https://arxiv.org/abs/2602.19520
+- Akey P., et al. (2026). _Who Wins and Who Loses In Prediction Markets?_ SSRN. https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6443103
+- Vedova, J. (2026). _Who Profits from Prediction Markets? Execution, not Information_. SSRN. https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6191618
+
+---
 
 ## Contributing
 
-If you'd like to contribute to this project, please open a pull-request with your changes, as well as detailed information on what is changed, added, or improved.
+Issues and PRs welcome. For warehouse/ETL changes, include a smoke command (`--max-trade-files 10`) or note which Phase 1/2 step you tested.
 
-For more information, see the [contributing guide](CONTRIBUTING.md).
-
-## Issues
-
-If you've found an issue or have a question, please open an issue [here](https://github.com/jon-becker/prediction-market-analysis/issues).
-
-## Research & Citations
-
-- Becker, J. (2026). _The Microstructure of Wealth Transfer in Prediction Markets_. Jbecker. https://jbecker.dev/research/prediction-market-microstructure
-- Le, N. A. (2026). _Decomposing Crowd Wisdom: Domain-Specific Calibration Dynamics in Prediction Markets_. arXiv. https://arxiv.org/abs/2602.19520
-- Akey P., Gregoire, V., Harvie, N., Martineau, C. (2026). _Who Wins and Who Loses In Prediction Markets? Evidence from Polymarket_. SSRN. https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6443103
-- Vedova, J. (2026). _Who Profits from Prediction Markets? Execution, not Information_. SSRN. https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6191618
-
-If you have used or plan to use this dataset in your research, please reach out via [email](mailto:jonathan@jbecker.dev) or [Twitter](https://x.com/BeckerrJon) -- i'd love to hear about what you're using the data for! Additionally, feel free to open a PR and update this section with a link to your paper.
+For upstream indexer/analysis bugs, consider opening on [Jon-Becker/prediction-market-analysis](https://github.com/Jon-Becker/prediction-market-analysis/issues) as well.
