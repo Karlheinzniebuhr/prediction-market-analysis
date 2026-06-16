@@ -58,8 +58,9 @@ class PolymarketTradesIndexer(Indexer):
         if from_block is None:
             if CURSOR_FILE.exists():
                 try:
-                    from_block = int(CURSOR_FILE.read_text().strip())
-                    print(f"Resuming from block {from_block}")
+                    cursor_block = int(CURSOR_FILE.read_text().strip())
+                    from_block = cursor_block + 1
+                    print(f"Resuming from block {from_block} (after cursor {cursor_block})")
                 except (ValueError, TypeError):
                     from_block = POLYMARKET_START_BLOCK
             else:
@@ -146,6 +147,10 @@ class PolymarketTradesIndexer(Indexer):
                     "timed out",
                     "connection",
                     "reset",
+                    "prematurely",
+                    "chunkedencoding",
+                    "protocolerror",
+                    "broken pipe",
                     "502",
                     "503",
                     "504",
