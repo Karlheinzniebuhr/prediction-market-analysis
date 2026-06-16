@@ -287,7 +287,7 @@ data/
 
 **Raw dataset and research platform:** [Jon Becker](https://github.com/Jon-Becker/prediction-market-analysis).
 
-**Warehouse ETL and Phase 2 tooling:** [Karlheinz Niebuhr](https://github.com/Karlheinzniebuhr/prediction-market-analysis).
+**Warehouse ETL and Phase 2 tooling:** [Karlheinz Niebuhr](https://x.com/karlbooklover).
 
 Research using the underlying dataset:
 
