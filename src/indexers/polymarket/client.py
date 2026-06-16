@@ -1,5 +1,5 @@
 from collections.abc import Generator
-from typing import Union
+from typing import Optional, Union
 
 from src.common.client import HttpClient
 from src.indexers.polymarket.models import Market
@@ -33,7 +33,7 @@ class PolymarketClient:
         params = {"limit": limit, **kwargs}
         if after_cursor:
             params["after_cursor"] = after_cursor
-        data = self._get(f"{self.gamma_url}/markets/keyset", params=params)
+        data = self.http.get(f"{self.gamma_url}/markets/keyset", params=params)
         
         markets_raw = data.get("markets", []) if isinstance(data, dict) else []
         next_cursor = data.get("next_cursor") if isinstance(data, dict) else None
