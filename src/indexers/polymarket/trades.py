@@ -1,6 +1,7 @@
 """Indexer for Polymarket trades from the Polygon blockchain."""
 
 import os
+import sys
 import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -27,6 +28,13 @@ TRADES_MAX_WORKERS = int(os.getenv("TRADES_MAX_WORKERS", "20"))
 TRADES_INFLIGHT_CHUNKS = int(os.getenv("TRADES_INFLIGHT_CHUNKS", str(TRADES_MAX_WORKERS)))
 TRADES_CHUNK_RETRIES = int(os.getenv("TRADES_CHUNK_RETRIES", "8"))
 TRADES_BATCH_PAUSE_SEC = float(os.getenv("TRADES_BATCH_PAUSE_SEC", "0"))
+TRADES_HEARTBEAT_SEC = float(os.getenv("TRADES_HEARTBEAT_SEC", "30"))
+
+
+def _log(msg: str) -> None:
+    """Line-buffered status for PowerShell (tqdm alone can look idle for minutes)."""
+    tqdm.write(msg, file=sys.stderr)
+    sys.stderr.flush()
 
 
 class PolymarketTradesIndexer(Indexer):
@@ -90,7 +98,7 @@ class PolymarketTradesIndexer(Indexer):
             df = pd.DataFrame(trades_batch)
             df.to_parquet(chunk_path)
             total_saved += len(trades_batch)
-            tqdm.write(f"Saved {len(trades_batch)} trades to {chunk_path.name}")
+            tqdm.write(f"Saved {len(trades_batch)} trades to {chunk_path.name}", file=sys.stderr)
             return len(trades_batch)
 
         ranges: list[tuple[int, int]] = []
@@ -101,7 +109,20 @@ class PolymarketTradesIndexer(Indexer):
             current = end + 1
 
         total_chunks = len(ranges)
-        pbar = tqdm(total=total_chunks, desc="Backfilling", unit=" chunks")
+        _log(
+            f"Queued {total_chunks:,} chunks ({self._chunk_size} blocks each); "
+            f"first progress line may take 1-3 min while RPC warms up"
+        )
+        pbar = tqdm(
+            total=total_chunks,
+            desc="Backfilling",
+            unit=" chunks",
+            file=sys.stderr,
+            mininterval=1.0,
+            dynamic_ncols=True,
+        )
+        fetched_count = 0
+        last_heartbeat = time.monotonic()
 
         def _fetch_chunk_once(chunk_start: int, chunk_end: int) -> list[dict]:
             fetched_at = datetime.utcnow()
@@ -196,17 +217,47 @@ class PolymarketTradesIndexer(Indexer):
             in_flight: dict = {}
 
             with ThreadPoolExecutor(max_workers=TRADES_MAX_WORKERS) as chunk_pool:
-                while submit_idx < total_chunks and len(in_flight) < TRADES_INFLIGHT_CHUNKS:
+                prime_end = min(TRADES_INFLIGHT_CHUNKS, total_chunks)
+                while submit_idx < prime_end:
                     chunk_start, chunk_end = ranges[submit_idx]
                     future = chunk_pool.submit(fetch_chunk_trades, chunk_start, chunk_end)
                     in_flight[future] = submit_idx
                     submit_idx += 1
+                if in_flight:
+                    first_start, first_end = ranges[0]
+                    last_start, last_end = ranges[prime_end - 1]
+                    _log(
+                        f"RPC fetch started: {len(in_flight)} chunks in flight "
+                        f"(blocks {first_start}-{first_end} .. {last_start}-{last_end})"
+                    )
 
                 while in_flight:
-                    done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+                    done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED, timeout=TRADES_HEARTBEAT_SEC)
+                    if not done:
+                        now = time.monotonic()
+                        if now - last_heartbeat >= TRADES_HEARTBEAT_SEC:
+                            last_heartbeat = now
+                            if in_flight:
+                                oldest_idx = min(in_flight.values())
+                                o_start, o_end = ranges[oldest_idx]
+                                _log(
+                                    f"Still fetching… in_flight={len(in_flight)} "
+                                    f"fetched={fetched_count}/{total_chunks} "
+                                    f"committed={next_to_commit}/{total_chunks} "
+                                    f"oldest={o_start}-{o_end}"
+                                )
+                        continue
+                    last_heartbeat = time.monotonic()
                     for future in done:
                         idx = in_flight.pop(future)
-                        pending[idx] = future.result()
+                        chunk_start, chunk_end = ranges[idx]
+                        chunk_trades = future.result()
+                        fetched_count += 1
+                        _log(
+                            f"Fetched {chunk_start}-{chunk_end}: {len(chunk_trades)} trades "
+                            f"({fetched_count}/{total_chunks} fetched, {next_to_commit}/{total_chunks} committed)"
+                        )
+                        pending[idx] = chunk_trades
 
                         while next_to_commit in pending:
                             commit_chunk(next_to_commit, pending.pop(next_to_commit))
