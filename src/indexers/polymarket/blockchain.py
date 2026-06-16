@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, TypeVar
 
 from dotenv import load_dotenv
+from eth_abi import decode as abi_decode
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
@@ -168,23 +169,28 @@ class PolygonClient:
         )
         return block["timestamp"]
 
-    def _decode_order_filled(self, log: dict, contract) -> BlockchainTrade:
-        """Decode an OrderFilled event log."""
-        decoded = contract.events.OrderFilled().process_log(log)
-        args = decoded["args"]
-
+    @staticmethod
+    def _decode_order_filled(log: dict) -> BlockchainTrade:
+        """Decode an OrderFilled event log without web3 contract event machinery."""
+        topics = log["topics"]
+        tx_hash = log["transactionHash"]
+        order_hash = topics[1]
+        maker_asset_id, taker_asset_id, maker_amount, taker_amount, fee = abi_decode(
+            ["uint256", "uint256", "uint256", "uint256", "uint256"],
+            log["data"],
+        )
         return BlockchainTrade(
             block_number=log["blockNumber"],
-            transaction_hash=log["transactionHash"].hex(),
+            transaction_hash=tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash),
             log_index=log["logIndex"],
-            order_hash=args["orderHash"].hex(),
-            maker=args["maker"],
-            taker=args["taker"],
-            maker_asset_id=args["makerAssetId"],
-            taker_asset_id=args["takerAssetId"],
-            maker_amount=args["makerAmountFilled"],
-            taker_amount=args["takerAmountFilled"],
-            fee=args["fee"],
+            order_hash=order_hash.hex() if hasattr(order_hash, "hex") else str(order_hash),
+            maker=Web3.to_checksum_address("0x" + topics[2].hex()[-40:]),
+            taker=Web3.to_checksum_address("0x" + topics[3].hex()[-40:]),
+            maker_asset_id=maker_asset_id,
+            taker_asset_id=taker_asset_id,
+            maker_amount=maker_amount,
+            taker_amount=taker_amount,
+            fee=fee,
         )
 
     @staticmethod
@@ -210,8 +216,6 @@ class PolygonClient:
         contract_address: str = CTF_EXCHANGE,
     ) -> list[BlockchainTrade]:
         """Fetch OrderFilled events from a block range."""
-        contract = self.ctf_exchange if contract_address.lower() == CTF_EXCHANGE.lower() else self.negrisk_exchange
-
         try:
             logs = _rpc_call_with_retry(
                 lambda: self.w3.eth.get_logs(
@@ -232,17 +236,10 @@ class PolygonClient:
                 )
             raise
 
-        if len(logs) >= 10_000 and to_block > from_block:
-            mid = (from_block + to_block) // 2
-            return self.get_trades(from_block, mid, contract_address) + self.get_trades(
-                mid + 1, to_block, contract_address
-            )
-
         trades = []
         for log in logs:
             try:
-                trade = self._decode_order_filled(log, contract)
-                trades.append(trade)
+                trades.append(self._decode_order_filled(log))
             except Exception as e:
                 print(f"Error decoding log: {e}")
 

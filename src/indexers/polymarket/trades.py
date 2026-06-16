@@ -2,6 +2,7 @@
 
 import os
 import sys
+import threading
 import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -10,7 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from tqdm import tqdm
 
 from src.common.indexer import Indexer
@@ -29,6 +31,16 @@ TRADES_INFLIGHT_CHUNKS = int(os.getenv("TRADES_INFLIGHT_CHUNKS", str(TRADES_MAX_
 TRADES_CHUNK_RETRIES = int(os.getenv("TRADES_CHUNK_RETRIES", "8"))
 TRADES_BATCH_PAUSE_SEC = float(os.getenv("TRADES_BATCH_PAUSE_SEC", "0"))
 TRADES_HEARTBEAT_SEC = float(os.getenv("TRADES_HEARTBEAT_SEC", "30"))
+
+_tls = threading.local()
+
+
+def _get_polygon_client() -> PolygonClient:
+    client = getattr(_tls, "client", None)
+    if client is None:
+        client = PolygonClient()
+        _tls.client = client
+    return client
 
 
 def _log(msg: str) -> None:
@@ -95,8 +107,7 @@ class PolymarketTradesIndexer(Indexer):
             if not trades_batch:
                 return 0
             chunk_path = DATA_DIR / f"trades_{chunk_start}_{chunk_end}.parquet"
-            df = pd.DataFrame(trades_batch)
-            df.to_parquet(chunk_path)
+            pq.write_table(pa.Table.from_pylist(trades_batch), chunk_path, compression="snappy")
             total_saved += len(trades_batch)
             tqdm.write(f"Saved {len(trades_batch)} trades to {chunk_path.name}", file=sys.stderr)
             return len(trades_batch)
@@ -130,7 +141,8 @@ class PolymarketTradesIndexer(Indexer):
 
             def fetch_contract(contract_name: str, contract_address: str) -> list[dict]:
                 rows: list[dict] = []
-                trades = client.get_trades(
+                chunk_client = _get_polygon_client()
+                trades = chunk_client.get_trades(
                     from_block=chunk_start,
                     to_block=chunk_end,
                     contract_address=contract_address,
