@@ -11,7 +11,9 @@ class AdaptiveChunkSizer:
 
     Uses an exponential moving average of observed logs/block density so sparse
     historical eras get large chunks (fewer RPC calls) while dense chain-head
-    periods shrink automatically. Updates happen only on in-order commits.
+    periods shrink automatically. Updates happen only on in-order commits, and
+    overshoots feed back immediately so the controller backs off before it keeps
+    hitting the provider ceiling.
     """
 
     target_logs: int = 8500
@@ -49,4 +51,7 @@ class AdaptiveChunkSizer:
             return
 
         ideal = int(self.target_logs / self._density)
+        if peak_logs >= self.target_logs:
+            pressure = max(1.0, peak_logs / self.target_logs)
+            ideal = min(ideal, max(self.min_blocks, int(blocks / pressure)))
         self._blocks = max(self.min_blocks, min(self.max_blocks, ideal))

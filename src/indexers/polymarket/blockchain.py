@@ -45,8 +45,53 @@ RPC_RETRY_BASE_SEC = float(os.getenv("POLYGON_RPC_RETRY_BASE_SEC", "2.0"))
 
 T = TypeVar("T")
 
+RETRYABLE_RPC_STATUS_CODES = {429, 500, 502, 503, 504}
+SPLIT_RPC_STATUS_CODES = {400, 413}
+SPLIT_RPC_ERROR_TOKENS = (
+    "too large",
+    "bad request",
+    "limit exceeded",
+    "query returned more than",
+    "response size",
+    "result too large",
+    "exceeds max",
+)
 
-def _rpc_call_with_retry(fn: Callable[[], T], label: str) -> T:
+
+def _exception_status_code(exc: Exception) -> Optional[int]:
+    """Best-effort extraction of an HTTP status code from wrapped RPC errors."""
+    current = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code
+
+        next_exc = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        if not isinstance(next_exc, Exception):
+            return None
+        current = next_exc
+    return None
+
+
+def _is_split_log_range_error(exc: Exception) -> bool:
+    """True when the RPC likely rejected a log query range."""
+    status_code = _exception_status_code(exc)
+    if status_code in SPLIT_RPC_STATUS_CODES:
+        return True
+
+    err = str(exc).lower()
+    return any(token in err for token in SPLIT_RPC_ERROR_TOKENS)
+
+
+def _rpc_call_with_retry(
+    fn: Callable[[], T],
+    label: str,
+    *,
+    split_status_codes: tuple[int, ...] = (),
+) -> T:
     last_err: Exception | None = None
     for attempt in range(RPC_MAX_RETRIES):
         try:
@@ -54,26 +99,34 @@ def _rpc_call_with_retry(fn: Callable[[], T], label: str) -> T:
         except Exception as e:
             last_err = e
             err = str(e).lower()
-            retryable = any(
-                token in err
-                for token in (
-                    "429",
-                    "400",
-                    "bad request",
-                    "too many requests",
-                    "timeout",
-                    "timed out",
-                    "connection",
-                    "reset",
-                    "prematurely",
-                    "chunkedencoding",
-                    "protocolerror",
-                    "broken pipe",
-                    "502",
-                    "503",
-                    "504",
-                    "gateway",
-                    "rate limit",
+            status_code = _exception_status_code(e)
+
+            if split_status_codes and (status_code in split_status_codes or _is_split_log_range_error(e)):
+                raise
+
+            retryable = (
+                status_code in RETRYABLE_RPC_STATUS_CODES
+                or any(
+                    token in err
+                    for token in (
+                        "429",
+                        "400",
+                        "bad request",
+                        "too many requests",
+                        "timeout",
+                        "timed out",
+                        "connection",
+                        "reset",
+                        "prematurely",
+                        "chunkedencoding",
+                        "protocolerror",
+                        "broken pipe",
+                        "502",
+                        "503",
+                        "504",
+                        "gateway",
+                        "rate limit",
+                    )
                 )
             )
             if retryable:
@@ -195,19 +248,7 @@ class PolygonClient:
 
     @staticmethod
     def _should_split_log_range(exc: Exception) -> bool:
-        err = str(exc).lower()
-        return any(
-            token in err
-            for token in (
-                "too large",
-                "limit exceeded",
-                "query returned more than",
-                "413",
-                "response size",
-                "result too large",
-                "exceeds max",
-            )
-        )
+        return _is_split_log_range_error(exc)
 
     def get_trades(
         self,
@@ -227,6 +268,7 @@ class PolygonClient:
                     }
                 ),
                 f"get_logs({from_block}-{to_block})",
+                split_status_codes=(400, 413),
             )
         except Exception as exc:
             if self._should_split_log_range(exc) and to_block > from_block:
@@ -251,7 +293,7 @@ class PolygonClient:
             trades = self.get_trades(start, end, contract_address)
             return trades, start, end
         except Exception as e:
-            if "too large" in str(e).lower():
+            if self._should_split_log_range(e) and end > start:
                 # Split into two halves and fetch sequentially
                 mid = (start + end) // 2
                 t1, _, _ = self._fetch_chunk(start, mid, contract_address)

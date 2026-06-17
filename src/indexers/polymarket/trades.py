@@ -348,7 +348,18 @@ class PolymarketTradesIndexer(Indexer):
                     _log(f"RPC fetch started: {len(state['in_flight'])} chunks in flight")
 
                 while state["in_flight"]:
-                    done, _ = wait(state["in_flight"].keys(), return_when=FIRST_COMPLETED, timeout=TRADES_HEARTBEAT_SEC)
+                    try:
+                        done, _ = wait(
+                            state["in_flight"].keys(),
+                            return_when=FIRST_COMPLETED,
+                            timeout=TRADES_HEARTBEAT_SEC,
+                        )
+                    except KeyboardInterrupt:
+                        interrupted = True
+                        _log("Interrupt received while waiting; draining completed chunks")
+                        done = {future for future in state["in_flight"].keys() if future.done()}
+                        if not done:
+                            continue
                     if not done:
                         now = time.monotonic()
                         if now - last_heartbeat >= TRADES_HEARTBEAT_SEC:
@@ -362,7 +373,15 @@ class PolymarketTradesIndexer(Indexer):
                     last_heartbeat = time.monotonic()
                     for future in done:
                         chunk_start, chunk_end = state["in_flight"].pop(future)
-                        chunk_rows, peak_logs = future.result()
+                        try:
+                            chunk_rows, peak_logs = future.result()
+                        except KeyboardInterrupt:
+                            interrupted = True
+                            _log(
+                                f"Interrupt received while fetching {chunk_start}-{chunk_end}; "
+                                "draining completed chunks"
+                            )
+                            continue
                         fetched_count += 1
                         _log(
                             f"Fetched {chunk_start}-{chunk_end}: {len(chunk_rows)} trades "
@@ -378,7 +397,8 @@ class PolymarketTradesIndexer(Indexer):
                             pbar.set_postfix(block=c_end, saved=total_saved, last=saved, span=c_end - c_start + 1)
                             CURSOR_FILE.write_text(str(c_end))
                             next_commit = c_end + 1
-                            after_commit(c_start, c_end, c_peak, submit_fn)
+                            if not interrupted:
+                                after_commit(c_start, c_end, c_peak, submit_fn)
                             if TRADES_BATCH_PAUSE_SEC > 0:
                                 time.sleep(TRADES_BATCH_PAUSE_SEC)
 
@@ -396,4 +416,7 @@ class PolymarketTradesIndexer(Indexer):
         if not interrupted and CURSOR_FILE.exists():
             CURSOR_FILE.unlink()
 
-        print(f"\nBackfill complete: {total_saved} trades saved")
+        if interrupted:
+            print(f"\nBackfill interrupted: {total_saved} trades saved")
+        else:
+            print(f"\nBackfill complete: {total_saved} trades saved")
