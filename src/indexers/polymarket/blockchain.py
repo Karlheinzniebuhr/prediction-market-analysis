@@ -7,10 +7,14 @@ from collections.abc import Generator
 from dataclasses import dataclass
 from typing import Callable, Optional, TypeVar
 
+from datetime import datetime
+
 from dotenv import load_dotenv
 from eth_abi import decode as abi_decode
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
+
+from src.indexers.polymarket.trade_batch import TradeBatch
 
 load_dotenv()
 
@@ -255,8 +259,12 @@ class PolygonClient:
         from_block: int,
         to_block: int,
         contract_address: str = CTF_EXCHANGE,
-    ) -> list[BlockchainTrade]:
+        *,
+        contract_name: str = "",
+        fetched_at: Optional[datetime] = None,
+    ) -> TradeBatch:
         """Fetch OrderFilled events from a block range."""
+        fetched_at = fetched_at or datetime.utcnow()
         try:
             logs = _rpc_call_with_retry(
                 lambda: self.w3.eth.get_logs(
@@ -273,35 +281,49 @@ class PolygonClient:
         except Exception as exc:
             if self._should_split_log_range(exc) and to_block > from_block:
                 mid = (from_block + to_block) // 2
-                return self.get_trades(from_block, mid, contract_address) + self.get_trades(
-                    mid + 1, to_block, contract_address
+                left = self.get_trades(
+                    from_block,
+                    mid,
+                    contract_address,
+                    contract_name=contract_name,
+                    fetched_at=fetched_at,
                 )
+                right = self.get_trades(
+                    mid + 1,
+                    to_block,
+                    contract_address,
+                    contract_name=contract_name,
+                    fetched_at=fetched_at,
+                )
+                left.extend(right)
+                return left
             raise
 
-        trades = []
+        batch = TradeBatch.empty()
         for log in logs:
             try:
-                trades.append(self._decode_order_filled(log))
+                batch.append_log(log, contract_name=contract_name, fetched_at=fetched_at)
             except Exception as e:
                 print(f"Error decoding log: {e}")
 
-        return trades
+        return batch
 
-    def _fetch_chunk(self, start: int, end: int, contract_address: str) -> tuple[list[BlockchainTrade], int, int]:
+    def _fetch_chunk(self, start: int, end: int, contract_address: str) -> tuple[TradeBatch, int, int]:
         """Fetch a single chunk of trades. Used by thread pool."""
         try:
-            trades = self.get_trades(start, end, contract_address)
-            return trades, start, end
+            batch = self.get_trades(start, end, contract_address)
+            return batch, start, end
         except Exception as e:
             if self._should_split_log_range(e) and end > start:
                 # Split into two halves and fetch sequentially
                 mid = (start + end) // 2
                 t1, _, _ = self._fetch_chunk(start, mid, contract_address)
                 t2, _, _ = self._fetch_chunk(mid + 1, end, contract_address)
-                return t1 + t2, start, end
+                t1.extend(t2)
+                return t1, start, end
             else:
                 print(f"Error fetching blocks {start}-{end}: {e}")
-                return [], start, end
+                return TradeBatch.empty(), start, end
 
     def iter_trades(
         self,
@@ -310,7 +332,7 @@ class PolygonClient:
         chunk_size: int = 1000,
         contract_address: str = CTF_EXCHANGE,
         max_workers: int = 5,
-    ) -> Generator[tuple[list[BlockchainTrade], int, int], None, None]:
+    ) -> Generator[tuple[TradeBatch, int, int], None, None]:
         """Iterate through trades in chunks of blocks using parallel fetching.
 
         Args:

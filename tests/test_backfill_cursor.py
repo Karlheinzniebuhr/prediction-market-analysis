@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+from src.indexers.polymarket.trade_batch import TradeBatch
 
 
 @dataclass
@@ -18,6 +21,7 @@ class FakeTrade:
     taker_asset_id: int = 1
     maker_amount: int = 100
     taker_amount: int = 200
+    fee: int = 0
     block_number: int = 1000
     transaction_hash: str = "0xabc"
     log_index: int = 0
@@ -33,11 +37,23 @@ class FakeClient:
     def get_block_number(self) -> int:
         return 5000
 
-    def get_trades(self, from_block: int, to_block: int, contract_address: str) -> list:
+    def get_trades(
+        self,
+        from_block: int,
+        to_block: int,
+        contract_address: str,
+        *,
+        contract_name: str = "",
+        fetched_at: datetime | None = None,
+    ) -> TradeBatch:
         if self._interrupt_at is not None and from_block >= self._interrupt_at:
             raise KeyboardInterrupt
         self.requested_ranges.append((from_block, to_block))
-        return [FakeTrade(block_number=from_block)]
+        return TradeBatch.from_trades(
+            [FakeTrade(block_number=from_block)],
+            contract_name=contract_name,
+            fetched_at=fetched_at or datetime.utcnow(),
+        )
 
 
 @pytest.fixture()

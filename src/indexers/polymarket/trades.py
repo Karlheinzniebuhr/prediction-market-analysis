@@ -6,13 +6,10 @@ import threading
 import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-import pyarrow as pa
-import pyarrow.parquet as pq
 from tqdm import tqdm
 
 from src.common.indexer import Indexer
@@ -23,12 +20,14 @@ from src.indexers.polymarket.blockchain import (
     POLYMARKET_START_BLOCK,
     PolygonClient,
 )
+from src.indexers.polymarket.trade_batch import TradeBatch
 
 DATA_DIR = Path("data/polymarket/trades")
 CURSOR_FILE = Path("data/polymarket/.backfill_block_cursor")
 DEFAULT_CHUNK_SIZE = int(os.getenv("TRADES_CHUNK_SIZE", "100"))
 TRADES_MAX_WORKERS = int(os.getenv("TRADES_MAX_WORKERS", "20"))
 TRADES_INFLIGHT_CHUNKS = int(os.getenv("TRADES_INFLIGHT_CHUNKS", str(TRADES_MAX_WORKERS)))
+TRADES_DECODE_INFLIGHT = int(os.getenv("TRADES_DECODE_INFLIGHT", "4"))
 TRADES_CHUNK_RETRIES = int(os.getenv("TRADES_CHUNK_RETRIES", "8"))
 TRADES_BATCH_PAUSE_SEC = float(os.getenv("TRADES_BATCH_PAUSE_SEC", "0"))
 TRADES_HEARTBEAT_SEC = float(os.getenv("TRADES_HEARTBEAT_SEC", "30"))
@@ -44,6 +43,7 @@ CONTRACTS = [
 ]
 
 _tls = threading.local()
+_decode_semaphore = threading.Semaphore(max(1, TRADES_DECODE_INFLIGHT))
 
 
 def _get_polygon_client() -> PolygonClient:
@@ -88,41 +88,41 @@ def _is_transient_rpc_error(exc: Exception) -> bool:
     )
 
 
-def _fetch_contract_rows(chunk_start: int, chunk_end: int, contract_name: str, contract_address: str) -> tuple[list[dict], int]:
+def _fetch_contract_batch(
+    chunk_start: int,
+    chunk_end: int,
+    contract_name: str,
+    contract_address: str,
+) -> tuple[TradeBatch, int]:
     fetched_at = datetime.utcnow()
     chunk_client = _get_polygon_client()
-    trades = chunk_client.get_trades(
-        from_block=chunk_start,
-        to_block=chunk_end,
-        contract_address=contract_address,
-    )
-    rows: list[dict] = []
-    for trade in trades:
-        trade_dict = asdict(trade)
-        trade_dict["maker_asset_id"] = str(trade_dict["maker_asset_id"])
-        trade_dict["taker_asset_id"] = str(trade_dict["taker_asset_id"])
-        trade_dict["_fetched_at"] = fetched_at
-        trade_dict["_contract"] = contract_name
-        rows.append(trade_dict)
-    return rows, len(trades)
+    with _decode_semaphore:
+        batch = chunk_client.get_trades(
+            from_block=chunk_start,
+            to_block=chunk_end,
+            contract_address=contract_address,
+            contract_name=contract_name,
+            fetched_at=fetched_at,
+        )
+    return batch, len(batch)
 
 
-def _fetch_chunk_once(chunk_start: int, chunk_end: int) -> tuple[list[dict], int]:
-    chunk_rows: list[dict] = []
+def _fetch_chunk_once(chunk_start: int, chunk_end: int) -> tuple[TradeBatch, int]:
+    chunk_batch = TradeBatch.empty()
     peak_logs = 0
     with ThreadPoolExecutor(max_workers=2) as contract_pool:
         futures = [
-            contract_pool.submit(_fetch_contract_rows, chunk_start, chunk_end, contract_name, contract_address)
+            contract_pool.submit(_fetch_contract_batch, chunk_start, chunk_end, contract_name, contract_address)
             for contract_name, contract_address in CONTRACTS
         ]
         for future in futures:
-            rows, log_count = future.result()
-            chunk_rows.extend(rows)
+            batch, log_count = future.result()
+            chunk_batch.extend(batch)
             peak_logs = max(peak_logs, log_count)
-    return chunk_rows, peak_logs
+    return chunk_batch, peak_logs
 
 
-def _fetch_chunk_trades(chunk_start: int, chunk_end: int) -> tuple[list[dict], int]:
+def _fetch_chunk_trades(chunk_start: int, chunk_end: int) -> tuple[TradeBatch, int]:
     last_err: Exception | None = None
     for attempt in range(TRADES_CHUNK_RETRIES):
         try:
@@ -133,9 +133,10 @@ def _fetch_chunk_trades(chunk_start: int, chunk_end: int) -> tuple[list[dict], i
                 mid = (chunk_start + chunk_end) // 2
                 tqdm.write(f"Chunk {chunk_start}-{chunk_end} too large; splitting at {mid}")
                 time.sleep(0.05)
-                left_rows, left_peak = _fetch_chunk_trades(chunk_start, mid)
-                right_rows, right_peak = _fetch_chunk_trades(mid + 1, chunk_end)
-                return left_rows + right_rows, max(left_peak, right_peak)
+                left_batch, left_peak = _fetch_chunk_trades(chunk_start, mid)
+                right_batch, right_peak = _fetch_chunk_trades(mid + 1, chunk_end)
+                left_batch.extend(right_batch)
+                return left_batch, max(left_peak, right_peak)
             if not _is_transient_rpc_error(exc):
                 raise
             wait_s = min(120.0, 2.0**attempt)
@@ -202,7 +203,9 @@ class PolymarketTradesIndexer(Indexer):
         print(
             "Throttle: "
             f"workers={TRADES_MAX_WORKERS}, "
-            f"inflight={TRADES_INFLIGHT_CHUNKS}, pause={TRADES_BATCH_PAUSE_SEC}s"
+            f"inflight={TRADES_INFLIGHT_CHUNKS}, "
+            f"decode_inflight={TRADES_DECODE_INFLIGHT}, "
+            f"pause={TRADES_BATCH_PAUSE_SEC}s"
         )
 
         if self._adaptive_chunks:
@@ -210,13 +213,13 @@ class PolymarketTradesIndexer(Indexer):
         else:
             self._run_fixed(from_block, to_block)
 
-    def _save_chunk(self, chunk_start: int, chunk_end: int, trades_batch: list[dict]) -> int:
-        if not trades_batch:
+    def _save_chunk(self, chunk_start: int, chunk_end: int, batch: TradeBatch) -> int:
+        if not batch.block_number:
             return 0
         chunk_path = DATA_DIR / f"trades_{chunk_start}_{chunk_end}.parquet"
-        pq.write_table(pa.Table.from_pylist(trades_batch), chunk_path, compression="snappy")
-        tqdm.write(f"Saved {len(trades_batch)} trades to {chunk_path.name}", file=sys.stderr)
-        return len(trades_batch)
+        saved = batch.write_parquet(chunk_path)
+        tqdm.write(f"Saved {saved} trades to {chunk_path.name}", file=sys.stderr)
+        return saved
 
     def _run_fixed(self, from_block: int, to_block: int) -> None:
         ranges: list[tuple[int, int]] = []
@@ -324,7 +327,7 @@ class PolymarketTradesIndexer(Indexer):
         total_saved = 0
         fetched_count = 0
         next_commit = from_block
-        pending: dict[int, tuple[int, int, list[dict], int]] = {}
+        pending: dict[int, tuple[int, int, TradeBatch, int]] = {}
         last_heartbeat = time.monotonic()
         interrupted = False
 
@@ -374,7 +377,7 @@ class PolymarketTradesIndexer(Indexer):
                     for future in done:
                         chunk_start, chunk_end = state["in_flight"].pop(future)
                         try:
-                            chunk_rows, peak_logs = future.result()
+                            chunk_batch, peak_logs = future.result()
                         except KeyboardInterrupt:
                             interrupted = True
                             _log(
@@ -384,14 +387,14 @@ class PolymarketTradesIndexer(Indexer):
                             continue
                         fetched_count += 1
                         _log(
-                            f"Fetched {chunk_start}-{chunk_end}: {len(chunk_rows)} trades "
+                            f"Fetched {chunk_start}-{chunk_end}: {len(chunk_batch)} trades "
                             f"(peak_logs={peak_logs}, commit_from={next_commit})"
                         )
-                        pending[chunk_start] = (chunk_start, chunk_end, chunk_rows, peak_logs)
+                        pending[chunk_start] = (chunk_start, chunk_end, chunk_batch, peak_logs)
 
                         while next_commit in pending:
-                            c_start, c_end, c_rows, c_peak = pending.pop(next_commit)
-                            saved = self._save_chunk(c_start, c_end, c_rows)
+                            c_start, c_end, c_batch, c_peak = pending.pop(next_commit)
+                            saved = self._save_chunk(c_start, c_end, c_batch)
                             total_saved += saved
                             pbar.update(progress_step(c_start, c_end))
                             pbar.set_postfix(block=c_end, saved=total_saved, last=saved, span=c_end - c_start + 1)
