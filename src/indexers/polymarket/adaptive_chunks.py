@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -40,17 +41,27 @@ class AdaptiveChunkSizer:
         if blocks <= 0:
             return
 
+        if peak_logs <= 0:
+            # Empty RPC ranges (future blocks / quiet spans): widen without
+            # driving the EMA toward zero, which can overflow ideal span math.
+            self._blocks = min(self.max_blocks, max(self._blocks * 2, self.min_blocks))
+            return
+
         sample_density = peak_logs / blocks
         if self._density is None:
             self._density = sample_density
         else:
             self._density = self.ema_alpha * sample_density + (1.0 - self.ema_alpha) * self._density
 
-        if self._density <= 0:
+        if self._density <= 0 or not math.isfinite(self._density):
             self._blocks = min(self.max_blocks, self._blocks * 2)
             return
 
-        ideal = int(self.target_logs / self._density)
+        ideal_ratio = self.target_logs / self._density
+        if not math.isfinite(ideal_ratio):
+            ideal = self.max_blocks
+        else:
+            ideal = int(ideal_ratio)
         if peak_logs >= self.target_logs:
             pressure = max(1.0, peak_logs / self.target_logs)
             ideal = min(ideal, max(self.min_blocks, int(blocks / pressure)))
