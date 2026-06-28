@@ -68,9 +68,15 @@ def test_get_trades_splits_on_bad_request(monkeypatch: pytest.MonkeyPatch):
 def test_fetch_chunk_stops_on_single_block_bad_request(monkeypatch: pytest.MonkeyPatch):
     from src.indexers.polymarket import blockchain as mod
 
+    monkeypatch.setattr(mod, "RPC_MAX_RETRIES", 1)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(TradeBatch, "append_log", _fake_append_log)
+
     calls: list[tuple[int, int]] = []
 
-    def fake_get_trades(start: int, end: int, contract_address: str, **kwargs):
+    def fake_get_logs(filter_params):
+        start = int(filter_params["fromBlock"])
+        end = int(filter_params["toBlock"])
         calls.append((start, end))
         response = Response()
         response.status_code = 400
@@ -80,14 +86,20 @@ def test_fetch_chunk_stops_on_single_block_bad_request(monkeypatch: pytest.Monke
             response=response,
         )
 
-    monkeypatch.setattr(mod, "RPC_MAX_RETRIES", 1)
-    monkeypatch.setattr(mod.time, "sleep", lambda *_args, **_kwargs: None)
-
     client = PolygonClient.__new__(PolygonClient)
-    client.get_trades = fake_get_trades
+    client.w3 = SimpleNamespace(eth=SimpleNamespace(get_logs=fake_get_logs))
 
-    batch, start, end = PolygonClient._fetch_chunk(client, 123, 123, CTF_EXCHANGE)
+    batch = PolygonClient.get_trades(client, 123, 123, CTF_EXCHANGE)
 
     assert len(batch) == 0
-    assert (start, end) == (123, 123)
     assert calls == [(123, 123)]
+
+
+def test_is_transient_rpc_error_treats_520_as_retryable():
+    from src.indexers.polymarket.blockchain import is_transient_rpc_error
+
+    response = Response()
+    response.status_code = 520
+    response.url = "https://polygon.drpc.org/"
+    exc = HTTPError("520 Server Error: <none> for url: https://polygon.drpc.org/", response=response)
+    assert is_transient_rpc_error(exc)

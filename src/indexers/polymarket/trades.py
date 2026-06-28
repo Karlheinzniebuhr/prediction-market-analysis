@@ -19,6 +19,7 @@ from src.indexers.polymarket.blockchain import (
     NEGRISK_CTF_EXCHANGE,
     POLYMARKET_START_BLOCK,
     PolygonClient,
+    is_transient_rpc_error,
 )
 from src.indexers.polymarket.trade_batch import TradeBatch
 
@@ -28,7 +29,7 @@ DEFAULT_CHUNK_SIZE = int(os.getenv("TRADES_CHUNK_SIZE", "100"))
 TRADES_MAX_WORKERS = int(os.getenv("TRADES_MAX_WORKERS", "20"))
 TRADES_INFLIGHT_CHUNKS = int(os.getenv("TRADES_INFLIGHT_CHUNKS", str(TRADES_MAX_WORKERS)))
 TRADES_DECODE_INFLIGHT = int(os.getenv("TRADES_DECODE_INFLIGHT", "4"))
-TRADES_CHUNK_RETRIES = int(os.getenv("TRADES_CHUNK_RETRIES", "8"))
+TRADES_CHUNK_RETRIES = int(os.getenv("TRADES_CHUNK_RETRIES", "0"))  # 0 = retry transient errors indefinitely
 TRADES_BATCH_PAUSE_SEC = float(os.getenv("TRADES_BATCH_PAUSE_SEC", "0"))
 TRADES_HEARTBEAT_SEC = float(os.getenv("TRADES_HEARTBEAT_SEC", "30"))
 TRADES_ADAPTIVE_CHUNKS = os.getenv("TRADES_ADAPTIVE_CHUNKS", "1") not in ("0", "false", "False")
@@ -59,33 +60,6 @@ def _log(msg: str) -> None:
     tqdm.write(msg, file=sys.stderr)
     sys.stderr.flush()
 
-
-def _is_transient_rpc_error(exc: Exception) -> bool:
-    if PolygonClient._should_split_log_range(exc):
-        return False
-    err = str(exc).lower()
-    return any(
-        token in err
-        for token in (
-            "429",
-            "400",
-            "bad request",
-            "too many requests",
-            "timeout",
-            "timed out",
-            "connection",
-            "reset",
-            "prematurely",
-            "chunkedencoding",
-            "protocolerror",
-            "broken pipe",
-            "502",
-            "503",
-            "504",
-            "gateway",
-            "rate limit",
-        )
-    )
 
 
 def _fetch_contract_batch(
@@ -123,12 +97,13 @@ def _fetch_chunk_once(chunk_start: int, chunk_end: int) -> tuple[TradeBatch, int
 
 
 def _fetch_chunk_trades(chunk_start: int, chunk_end: int) -> tuple[TradeBatch, int]:
-    last_err: Exception | None = None
-    for attempt in range(TRADES_CHUNK_RETRIES):
+    attempt = 0
+    while True:
         try:
             return _fetch_chunk_once(chunk_start, chunk_end)
+        except KeyboardInterrupt:
+            raise
         except Exception as exc:
-            last_err = exc
             if PolygonClient._should_split_log_range(exc) and chunk_end > chunk_start:
                 mid = (chunk_start + chunk_end) // 2
                 tqdm.write(f"Chunk {chunk_start}-{chunk_end} too large; splitting at {mid}")
@@ -137,15 +112,17 @@ def _fetch_chunk_trades(chunk_start: int, chunk_end: int) -> tuple[TradeBatch, i
                 right_batch, right_peak = _fetch_chunk_trades(mid + 1, chunk_end)
                 left_batch.extend(right_batch)
                 return left_batch, max(left_peak, right_peak)
-            if not _is_transient_rpc_error(exc):
+            if not is_transient_rpc_error(exc):
                 raise
-            wait_s = min(120.0, 2.0**attempt)
+            attempt += 1
+            if TRADES_CHUNK_RETRIES > 0 and attempt >= TRADES_CHUNK_RETRIES:
+                raise
+            wait_s = min(120.0, 2.0 ** min(attempt - 1, 7))
             tqdm.write(
                 f"Chunk {chunk_start}-{chunk_end} transient error ({exc}); "
-                f"retry {attempt + 1}/{TRADES_CHUNK_RETRIES} in {wait_s:.0f}s"
+                f"retry {attempt} in {wait_s:.0f}s"
             )
             time.sleep(wait_s)
-    raise last_err  # type: ignore[misc]
 
 
 class PolymarketTradesIndexer(Indexer):
@@ -385,6 +362,15 @@ class PolymarketTradesIndexer(Indexer):
                                 "draining completed chunks"
                             )
                             continue
+                        except Exception as exc:
+                            if is_transient_rpc_error(exc):
+                                _log(
+                                    f"Chunk {chunk_start}-{chunk_end} failed ({exc}); "
+                                    "re-queueing after other in-flight work"
+                                )
+                                submit_fn(chunk_start, chunk_end)
+                                continue
+                            raise
                         fetched_count += 1
                         _log(
                             f"Fetched {chunk_start}-{chunk_end}: {len(chunk_batch)} trades "
@@ -412,7 +398,8 @@ class PolymarketTradesIndexer(Indexer):
             traceback.print_exc()
             cursor = CURSOR_FILE.read_text().strip() if CURSOR_FILE.exists() else str(from_block)
             print(f"\nBackfill failed at cursor block {cursor}: {exc}")
-            raise SystemExit(1) from exc
+            print("Restart the same command to resume from the saved cursor.")
+            return
         finally:
             pbar.close()
 

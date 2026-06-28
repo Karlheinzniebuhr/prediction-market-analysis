@@ -44,12 +44,12 @@ ORDER_FILLED_ABI = {
 
 # Public Polygon RPC
 POLYGON_RPC = os.getenv("POLYGON_RPC", "")
-RPC_MAX_RETRIES = int(os.getenv("POLYGON_RPC_MAX_RETRIES", "6"))
+RPC_MAX_RETRIES = int(os.getenv("POLYGON_RPC_MAX_RETRIES", "10"))
 RPC_RETRY_BASE_SEC = float(os.getenv("POLYGON_RPC_RETRY_BASE_SEC", "2.0"))
 
 T = TypeVar("T")
 
-RETRYABLE_RPC_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRYABLE_RPC_STATUS_CODES = {429, 500, 502, 503, 504, 520, 521, 522, 524}
 SPLIT_RPC_STATUS_CODES = {400, 413}
 SPLIT_RPC_ERROR_TOKENS = (
     "too large",
@@ -59,6 +59,29 @@ SPLIT_RPC_ERROR_TOKENS = (
     "response size",
     "result too large",
     "exceeds max",
+)
+TRANSIENT_RPC_ERROR_TOKENS = (
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "520",
+    "521",
+    "522",
+    "524",
+    "too many requests",
+    "timeout",
+    "timed out",
+    "connection",
+    "reset",
+    "prematurely",
+    "chunkedencoding",
+    "protocolerror",
+    "broken pipe",
+    "gateway",
+    "rate limit",
+    "server error",
 )
 
 
@@ -90,6 +113,17 @@ def _is_split_log_range_error(exc: Exception) -> bool:
     return any(token in err for token in SPLIT_RPC_ERROR_TOKENS)
 
 
+def is_transient_rpc_error(exc: Exception) -> bool:
+    """True for rate limits, gateway blips, and other retryable RPC failures."""
+    if _is_split_log_range_error(exc):
+        return False
+    status_code = _exception_status_code(exc)
+    if status_code in RETRYABLE_RPC_STATUS_CODES:
+        return True
+    err = str(exc).lower()
+    return any(token in err for token in TRANSIENT_RPC_ERROR_TOKENS)
+
+
 def _rpc_call_with_retry(
     fn: Callable[[], T],
     label: str,
@@ -110,28 +144,7 @@ def _rpc_call_with_retry(
 
             retryable = (
                 status_code in RETRYABLE_RPC_STATUS_CODES
-                or any(
-                    token in err
-                    for token in (
-                        "429",
-                        "400",
-                        "bad request",
-                        "too many requests",
-                        "timeout",
-                        "timed out",
-                        "connection",
-                        "reset",
-                        "prematurely",
-                        "chunkedencoding",
-                        "protocolerror",
-                        "broken pipe",
-                        "502",
-                        "503",
-                        "504",
-                        "gateway",
-                        "rate limit",
-                    )
-                )
+                or any(token in err for token in TRANSIENT_RPC_ERROR_TOKENS)
             )
             if retryable:
                 time.sleep(min(60.0, RPC_RETRY_BASE_SEC * (2 ** attempt)))
@@ -254,6 +267,10 @@ class PolygonClient:
     def _should_split_log_range(exc: Exception) -> bool:
         return _is_split_log_range_error(exc)
 
+    @staticmethod
+    def is_transient_rpc_error(exc: Exception) -> bool:
+        return is_transient_rpc_error(exc)
+
     def get_trades(
         self,
         from_block: int,
@@ -297,6 +314,8 @@ class PolygonClient:
                 )
                 left.extend(right)
                 return left
+            if self._should_split_log_range(exc):
+                return TradeBatch.empty()
             raise
 
         batch = TradeBatch.empty()
